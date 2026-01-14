@@ -201,9 +201,20 @@ pub const Executor = struct {
     env: std.process.EnvMap,
     tmpdir: []const u8,
 
-    pub fn init(allocator: Allocator, shell: []const u8, tmpdir: []const u8) !Executor {
+    pub fn init(allocator: Allocator, shell: []const u8, tmpdir: []const u8, opts: *const Options) !Executor {
         var env = std.process.EnvMap.init(allocator);
-        // Set up clean environment
+
+        // Start with inherited env or clean slate
+        if (opts.inherit_env) {
+            var parent_env = std.process.getEnvMap(allocator) catch std.process.EnvMap.init(allocator);
+            defer parent_env.deinit();
+            var it = parent_env.iterator();
+            while (it.next()) |entry| {
+                try env.put(entry.key_ptr.*, entry.value_ptr.*);
+            }
+        }
+
+        // Set up normalized environment (overrides inherited)
         try env.put("LANG", "C");
         try env.put("LC_ALL", "C");
         try env.put("LANGUAGE", "C");
@@ -217,6 +228,36 @@ pub const Executor = struct {
         try env.put("HOME", tmpdir);
         try env.put("QUIZZIG", "1");
 
+        // Build PATH: bindirs (reversed) + base path
+        const base_path = if (opts.inherit_env)
+            env.get("PATH") orelse "/usr/local/bin:/usr/bin:/bin"
+        else
+            "/usr/local/bin:/usr/bin:/bin";
+
+        if (opts.bindirs.len > 0) {
+            var path_parts: std.ArrayListUnmanaged(u8) = .{};
+            defer path_parts.deinit(allocator);
+
+            // Prepend bindirs in reverse order (last flag = first in PATH)
+            var i: usize = opts.bindirs.len;
+            while (i > 0) {
+                i -= 1;
+                try path_parts.appendSlice(allocator, opts.bindirs[i]);
+                try path_parts.append(allocator, ':');
+            }
+            try path_parts.appendSlice(allocator, base_path);
+
+            // EnvMap.put dupes the value internally
+            try env.put("PATH", path_parts.items);
+        } else {
+            try env.put("PATH", base_path);
+        }
+
+        // Apply custom env vars (--env takes precedence)
+        for (opts.env_vars) |ev| {
+            try env.put(ev.key, ev.value);
+        }
+
         return .{
             .allocator = allocator,
             .shell = shell,
@@ -229,23 +270,24 @@ pub const Executor = struct {
         self.env.deinit();
     }
 
-    pub fn setTestEnv(self: *Executor, testdir: []const u8, testfile: []const u8) !void {
+    pub fn setTestEnv(self: *Executor, testdir: []const u8, testfile: []const u8, rootdir: []const u8) !void {
         try self.env.put("TESTDIR", testdir);
         try self.env.put("TESTFILE", testfile);
         try self.env.put("TESTSHELL", self.shell);
         try self.env.put("CRAMTMP", self.tmpdir);
+        try self.env.put("ROOTDIR", rootdir);
     }
 
-    const salt_prefix = "QUIZZIG";
-
-    pub fn execute(self: *Executor, commands: []const TestCommand) !std.ArrayListUnmanaged(CommandResult) {
+    pub fn execute(self: *Executor, commands: []const TestCommand, debug: bool) !std.ArrayListUnmanaged(CommandResult) {
         var results: std.ArrayListUnmanaged(CommandResult) = .{};
+
+        // Generate unique salt to avoid collisions with nested quizzig runs
+        var salt_buf: [32]u8 = undefined;
+        const salt = try std.fmt.bufPrint(&salt_buf, "QUIZZIG{x}", .{std.crypto.random.int(u64)});
 
         // Build script with salt markers
         var script: std.ArrayListUnmanaged(u8) = .{};
         defer script.deinit(self.allocator);
-
-        const timestamp = std.time.timestamp();
 
         for (commands, 0..) |cmd, i| {
             // Write command
@@ -254,7 +296,9 @@ pub const Executor = struct {
                 try script.append(self.allocator, '\n');
             }
             // Write salt marker - capture exit code first, then output marker
-            try script.writer(self.allocator).print("__qz_ec=$?; printf '\\n{s}{d} {d} '\"$__qz_ec\"'\\n'\n", .{ salt_prefix, timestamp, i });
+            if (!debug) {
+                try script.writer(self.allocator).print("__qz_ec=$?; env printf '\\n{s} {d} '\"$__qz_ec\"'\\n'\n", .{ salt, i });
+            }
         }
 
         // Execute script via shell, merging stderr into stdout
@@ -263,7 +307,8 @@ pub const Executor = struct {
             self.allocator,
         );
         child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
+        // In debug mode, let output go directly to terminal
+        child.stdout_behavior = if (debug) .Inherit else .Pipe;
         child.stderr_behavior = .Inherit;
         child.env_map = &self.env;
         child.cwd = self.tmpdir;
@@ -277,6 +322,16 @@ pub const Executor = struct {
             child.stdin = null;
         }
 
+        if (debug) {
+            // In debug mode, we don't capture output - just wait for completion
+            // All commands are considered "passed" since we can't compare
+            _ = try child.wait();
+            for (0..commands.len) |_| {
+                try results.append(self.allocator, .{ .output = "", .exit_code = 0 });
+            }
+            return results;
+        }
+
         // Read combined output
         const output = try child.stdout.?.readToEndAlloc(self.allocator, 10 * 1024 * 1024);
         defer self.allocator.free(output);
@@ -284,7 +339,7 @@ pub const Executor = struct {
         _ = try child.wait();
 
         // Parse output by salt markers
-        const salt_pattern = try std.fmt.allocPrint(self.allocator, "{s}{d} ", .{ salt_prefix, timestamp });
+        const salt_pattern = try std.fmt.allocPrint(self.allocator, "{s} ", .{salt});
         defer self.allocator.free(salt_pattern);
 
         var current_output: std.ArrayListUnmanaged(u8) = .{};
@@ -504,22 +559,34 @@ pub fn matchLine(expected: ExpectedLine, actual: []const u8, allocator: Allocato
 }
 
 // Diff generation
+pub const DiffResult = struct {
+    lines: std.ArrayListUnmanaged(DiffLine),
+    arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *DiffResult) void {
+        self.arena.deinit();
+    }
+};
+
 pub const DiffLine = struct {
     prefix: u8,
     content: []const u8,
 };
 
 pub fn generateDiff(
-    allocator: Allocator,
+    child_allocator: Allocator,
     expected_lines: []const ExpectedLine,
     actual: []const u8,
     exit_code: u8,
-) !std.ArrayListUnmanaged(DiffLine) {
+) !DiffResult {
+    var arena = std.heap.ArenaAllocator.init(child_allocator);
+    const allocator = arena.allocator();
+
     var diff: std.ArrayListUnmanaged(DiffLine) = .{};
 
     var actual_lines: std.ArrayListUnmanaged([]const u8) = .{};
-    defer actual_lines.deinit(allocator);
-
+    // actual_lines memory is managed by arena
+    
     if (actual.len > 0) {
         var iter = mem.splitScalar(u8, actual, '\n');
         while (iter.next()) |line| {
@@ -531,13 +598,9 @@ pub fn generateDiff(
     }
 
     // Add exit code line if non-zero (cram format)
-    var exit_code_buf: [16]u8 = undefined;
-    var exit_code_line: ?[]const u8 = null;
     if (exit_code != 0) {
-        exit_code_line = std.fmt.bufPrint(&exit_code_buf, "[{d}]", .{exit_code}) catch null;
-        if (exit_code_line) |ecl| {
-            try actual_lines.append(allocator, ecl);
-        }
+        const exit_code_line = try std.fmt.allocPrint(allocator, "[{d}]", .{exit_code});
+        try actual_lines.append(allocator, exit_code_line);
     }
 
     var ei: usize = 0;
@@ -567,7 +630,10 @@ pub fn generateDiff(
         }
     }
 
-    return diff;
+    return .{
+        .lines = diff,
+        .arena = arena,
+    };
 }
 
 pub fn hasDifferences(diff: []const DiffLine) bool {
@@ -575,6 +641,15 @@ pub fn hasDifferences(diff: []const DiffLine) bool {
         if (line.prefix != ' ') return true;
     }
     return false;
+}
+
+fn isPrintable(s: []const u8) bool {
+    for (s) |c| {
+        // Allow tab as printable-ish (common in text)
+        if (c == '\t') continue;
+        if (c < 0x20 or c >= 0x7f) return false;
+    }
+    return true;
 }
 
 // Test file runner
@@ -608,7 +683,8 @@ pub fn runTestFile(
 
     // Create unique temp directory for this test (matches cram's structure)
     const timestamp = std.time.timestamp();
-    const cramtmp = try std.fmt.allocPrint(allocator, "/tmp/cramtests-{d}", .{timestamp});
+    const random_id = std.crypto.random.int(u64);
+    const cramtmp = try std.fmt.allocPrint(allocator, "/tmp/cramtests-{d}-{x}", .{ timestamp, random_id });
     defer allocator.free(cramtmp);
     const tmpdir_name = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cramtmp, basename });
     defer allocator.free(tmpdir_name);
@@ -625,12 +701,12 @@ pub fn runTestFile(
         getStderr().print("# Keeping tmpdir: {s}\n", .{cramtmp}) catch {};
     }
 
-    var executor = try Executor.init(allocator, opts.shell, tmpdir_name);
+    var executor = try Executor.init(allocator, opts.shell, tmpdir_name, opts);
     defer executor.deinit();
 
-    try executor.setTestEnv(abs_dirname, basename);
+    try executor.setTestEnv(abs_dirname, basename, opts.rootdir);
 
-    var results = try executor.execute(commands.items);
+    var results = try executor.execute(commands.items, opts.debug);
     defer {
         for (results.items) |r| {
             allocator.free(r.output);
@@ -655,8 +731,9 @@ pub fn runTestFile(
             continue;
         }
 
-        var diff = try generateDiff(allocator, cmd.expected.items, result.output, result.exit_code);
-        defer diff.deinit(allocator);
+        var diff_result = try generateDiff(allocator, cmd.expected.items, result.output, result.exit_code);
+        defer diff_result.deinit();
+        const diff = diff_result.lines;
 
         const has_diff = hasDifferences(diff.items);
 
@@ -685,7 +762,13 @@ pub fn runTestFile(
                 // Output diff lines with indentation
                 const indent = "  "; // 2-space indent for .t files
                 for (diff.items) |line| {
-                    try out.print("{c}{s}{s}\n", .{ line.prefix, indent, line.content });
+                    if (isPrintable(line.content)) {
+                        try out.print("{c}{s}{s}\n", .{ line.prefix, indent, line.content });
+                    } else {
+                        const escaped = try escapeOutput(allocator, line.content);
+                        defer allocator.free(escaped);
+                        try out.print("{c}{s}{s} (esc)\n", .{ line.prefix, indent, escaped });
+                    }
                 }
             }
         } else {
@@ -706,6 +789,11 @@ pub const TestFileResult = struct {
     skipped: usize,
 };
 
+pub const EnvVar = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 pub const Options = struct {
     shell: []const u8 = "/bin/sh",
     indent: usize = 2,
@@ -713,9 +801,13 @@ pub const Options = struct {
     verbose: bool = false,
     interactive: bool = false,
     debug: bool = false,
-    preserve_env: bool = false,
+    inherit_env: bool = false,
     keep_tmpdir: bool = false,
     xunit_file: ?[]const u8 = null,
+    // Collected from CLI, stored externally due to allocation
+    bindirs: []const []const u8 = &.{},
+    env_vars: []const EnvVar = &.{},
+    rootdir: []const u8 = ".",
 };
 
 fn findTestFiles(allocator: Allocator, paths: []const []const u8) !std.ArrayListUnmanaged([]const u8) {
@@ -763,6 +855,15 @@ fn getStderr() std.fs.File.DeprecatedWriter {
     return std.fs.File.stderr().deprecatedWriter();
 }
 
+fn parseEnvVar(s: []const u8) ?EnvVar {
+    const eq_pos = mem.indexOf(u8, s, "=") orelse return null;
+    if (eq_pos == 0) return null;
+    return .{
+        .key = s[0..eq_pos],
+        .value = s[eq_pos + 1 ..],
+    };
+}
+
 fn printUsage() void {
     const usage =
         \\Usage: quizzig [OPTIONS] [TEST_FILES...]
@@ -779,11 +880,21 @@ fn printUsage() void {
         \\  --keep-tmpdir        Don't remove temp directories
         \\  --shell=PATH         Shell to use (default: /bin/sh)
         \\  --indent=N           Indentation spaces (default: 2)
+        \\  -E, --inherit-env    Inherit parent environment
+        \\  -e, --env VAR=VAL    Set environment variable (repeatable)
+        \\  --bindir=DIR         Prepend DIR to PATH (repeatable)
+        \\
+        \\Environment variables available in tests:
+        \\  TESTDIR    Absolute path to test file's directory
+        \\  TESTFILE   Test file basename
+        \\  ROOTDIR    Directory where quizzig was invoked
+        \\  CRAMTMP    Temp directory root
+        \\  QUIZZIG    Always "1"
         \\
         \\Test files should have a .t extension.
         \\
     ;
-    getStderr().print("{s}", .{usage}) catch {};
+    getStdout().print("{s}", .{usage}) catch {};
 }
 
 pub fn main() !void {
@@ -795,6 +906,15 @@ pub fn main() !void {
     var paths: std.ArrayListUnmanaged([]const u8) = .{};
     defer paths.deinit(allocator);
 
+    var bindirs: std.ArrayListUnmanaged([]const u8) = .{};
+    defer bindirs.deinit(allocator);
+    var env_vars: std.ArrayListUnmanaged(EnvVar) = .{};
+    defer env_vars.deinit(allocator);
+
+    // Capture rootdir (cwd where quizzig was invoked)
+    const rootdir = try fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(rootdir);
+
     var args = try process.argsWithAllocator(allocator);
     defer args.deinit();
 
@@ -805,7 +925,7 @@ pub fn main() !void {
             printUsage();
             return;
         } else if (mem.eql(u8, arg, "-V") or mem.eql(u8, arg, "--version")) {
-            getStderr().print("quizzig {s}\n", .{version}) catch {};
+            getStdout().print("quizzig {s}\n", .{version}) catch {};
             return;
         } else if (mem.eql(u8, arg, "-q") or mem.eql(u8, arg, "--quiet")) {
             opts.quiet = true;
@@ -817,14 +937,48 @@ pub fn main() !void {
             opts.debug = true;
         } else if (mem.eql(u8, arg, "--keep-tmpdir")) {
             opts.keep_tmpdir = true;
+        } else if (mem.eql(u8, arg, "-E") or mem.eql(u8, arg, "--inherit-env")) {
+            opts.inherit_env = true;
         } else if (mem.startsWith(u8, arg, "--shell=")) {
             opts.shell = arg[8..];
         } else if (mem.startsWith(u8, arg, "--indent=")) {
             opts.indent = try std.fmt.parseInt(usize, arg[9..], 10);
+        } else if (mem.startsWith(u8, arg, "--bindir=")) {
+            try bindirs.append(allocator, arg[9..]);
+        } else if (mem.eql(u8, arg, "--bindir")) {
+            if (args.next()) |dir| {
+                try bindirs.append(allocator, dir);
+            }
+        } else if (mem.startsWith(u8, arg, "--env=")) {
+            if (parseEnvVar(arg[6..])) |ev| {
+                try env_vars.append(allocator, ev);
+            }
+        } else if (mem.eql(u8, arg, "--env") or mem.eql(u8, arg, "-e")) {
+            if (args.next()) |val| {
+                if (parseEnvVar(val)) |ev| {
+                    try env_vars.append(allocator, ev);
+                }
+            }
         } else if (arg[0] != '-') {
             try paths.append(allocator, arg);
         }
     }
+
+    opts.env_vars = env_vars.items;
+    opts.rootdir = rootdir;
+
+    // Resolve bindirs to absolute paths
+    var abs_bindirs: std.ArrayListUnmanaged([]const u8) = .{};
+    defer {
+        for (abs_bindirs.items) |p| allocator.free(p);
+        abs_bindirs.deinit(allocator);
+    }
+
+    for (bindirs.items) |dir| {
+        const abs_dir = try fs.cwd().realpathAlloc(allocator, dir);
+        try abs_bindirs.append(allocator, abs_dir);
+    }
+    opts.bindirs = abs_bindirs.items;
 
     if (paths.items.len == 0) {
         printUsage();

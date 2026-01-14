@@ -29,6 +29,9 @@ quizzig [OPTIONS] [TEST_FILES...]
 - `-v, --verbose` - Show filenames and status
 - `--shell=PATH` - Shell to use (default: `/bin/sh`)
 - `--indent=N` - Indentation spaces (default: 2)
+- `-E, --inherit-env` - Inherit parent environment as base
+- `-e VAR=VAL, --env VAR=VAL` - Set environment variable (repeatable)
+- `--bindir=DIR` - Prepend DIR to PATH (repeatable)
 
 ## Test Format
 
@@ -103,14 +106,19 @@ Exit with code 80 to skip:
 
 ## Environment
 
-Tests run in isolated temp directories. These variables are set:
+Tests run in isolated temp directories with a minimal, controlled environment.
 
-- `TESTDIR` - Directory containing the test file
+**Variables set for tests:**
+- `TESTDIR` - Absolute path to test file's directory
 - `TESTFILE` - Test file basename
 - `TESTSHELL` - Shell being used
+- `ROOTDIR` - Directory where quizzig was invoked
 - `CRAMTMP` - Temp directory root
+- `QUIZZIG` - Always "1"
 
-Standard locale variables (`LANG`, `LC_ALL`, `TZ`, etc.) are normalized.
+**Default PATH:** `/usr/local/bin:/usr/bin:/bin` (use `--bindir` to prepend directories)
+
+Standard locale variables (`LANG`, `LC_ALL`, `TZ`, etc.) are normalized to `C`.
 
 ## Example
 
@@ -143,6 +151,21 @@ $ quizzig examples/basic.t
 Accept actual output (update test file with real output):
 ```sh
 $ quizzig test.t 2>/dev/null | patch -p0
+```
+
+**Testing your own binaries:**
+```sh
+# Add build output to PATH so tests can find your binaries
+$ quizzig --bindir ./zig-out/bin tests/*.t
+
+# Or use ROOTDIR in tests to reference project root
+$ echo '$ROOTDIR/zig-out/bin/mybin --help' > tests/help.t
+```
+
+**Inheriting environment:**
+```sh
+# Inherit parent env + add custom vars
+$ quizzig -E -e DEBUG=1 tests/*.t
 ```
 
 ## Building

@@ -10,7 +10,9 @@ release:
 
 test: build
 	zig build test
-	./zig-out/bin/quizzig examples/
+	./zig-out/bin/quizzig examples/advanced.t examples/bare.t examples/basic.t examples/empty.t examples/env.t examples/missingeol.t examples/skip.t examples/test.t
+	! ./zig-out/bin/quizzig examples/fail.t
+	./zig-out/bin/quizzig --bindir ./zig-out/bin tests/
 
 clean:
 	rm -rf zig-out .zig-cache
