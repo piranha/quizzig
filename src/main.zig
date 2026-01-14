@@ -674,7 +674,9 @@ pub fn runTestFile(
     }
 
     if (commands.items.len == 0) {
-        return .{ .passed = 0, .failed = 0, .skipped = 1 };
+        var skipped_tests: std.ArrayListUnmanaged(SkippedTest) = .{};
+        try skipped_tests.append(allocator, .{ .file = path, .line = 0, .command = try allocator.dupe(u8, "(no commands)") });
+        return .{ .passed = 0, .failed = 0, .skipped = 1, .skipped_tests = skipped_tests };
     }
 
     const basename = fs.path.basename(path);
@@ -718,6 +720,7 @@ pub fn runTestFile(
     var passed: usize = 0;
     var failed: usize = 0;
     var skipped: usize = 0;
+    var skipped_tests: std.ArrayListUnmanaged(SkippedTest) = .{};
 
     for (commands.items, 0..) |cmd, i| {
         if (i >= results.items.len) {
@@ -729,6 +732,9 @@ pub fn runTestFile(
 
         if (result.exit_code == 80) {
             skipped += 1;
+            const first_line = if (cmd.lines.items.len > 0) cmd.lines.items[0] else "";
+            const cmd_dupe = try allocator.dupe(u8, first_line);
+            try skipped_tests.append(allocator, .{ .file = path, .line = cmd.line_num, .command = cmd_dupe });
             continue;
         }
 
@@ -781,13 +787,21 @@ pub fn runTestFile(
         .passed = passed,
         .failed = failed,
         .skipped = skipped,
+        .skipped_tests = skipped_tests,
     };
 }
+
+pub const SkippedTest = struct {
+    file: []const u8,
+    line: usize,
+    command: []const u8,
+};
 
 pub const TestFileResult = struct {
     passed: usize,
     failed: usize,
     skipped: usize,
+    skipped_tests: std.ArrayListUnmanaged(SkippedTest),
 };
 
 pub const EnvVar = struct {
@@ -797,7 +811,7 @@ pub const EnvVar = struct {
 
 pub const Options = struct {
     shell: []const u8 = "/bin/sh",
-    indent: usize = 2,
+    indent: usize = 4,
     quiet: bool = false,
     verbose: bool = false,
     interactive: bool = false,
@@ -880,7 +894,7 @@ fn printUsage() void {
         \\  -d, --debug          Write output directly to terminal
         \\  --keep-tmpdir        Don't remove temp directories
         \\  --shell=PATH         Shell to use (default: /bin/sh)
-        \\  --indent=N           Indentation spaces (default: 2)
+        \\  --indent=N           Indentation spaces (default: 4)
         \\  -E, --inherit-env    Inherit parent environment
         \\  -e, --env VAR=VAL    Set environment variable (repeatable)
         \\  --bindir=DIR         Prepend DIR to PATH (repeatable)
@@ -1003,13 +1017,18 @@ pub fn main() !void {
     var total_passed: usize = 0;
     var total_failed: usize = 0;
     var total_skipped: usize = 0;
+    var all_skipped: std.ArrayListUnmanaged(SkippedTest) = .{};
+    defer {
+        for (all_skipped.items) |s| allocator.free(s.command);
+        all_skipped.deinit(allocator);
+    }
 
     for (test_files.items) |test_path| {
         if (opts.verbose) {
             try stderr.print("{s}: ", .{test_path});
         }
 
-        const result = runTestFile(allocator, test_path, &opts) catch |err| {
+        var result = runTestFile(allocator, test_path, &opts) catch |err| {
             try stderr.print("E", .{});
             if (opts.verbose) {
                 try stderr.print(" error: {}\n", .{err});
@@ -1017,10 +1036,12 @@ pub fn main() !void {
             total_failed += 1;
             continue;
         };
+        defer result.skipped_tests.deinit(allocator);
 
         total_passed += result.passed;
         total_failed += result.failed;
         total_skipped += result.skipped;
+        try all_skipped.appendSlice(allocator, result.skipped_tests.items);
 
         if (result.failed > 0) {
             try stderr.print("!", .{});
@@ -1040,6 +1061,17 @@ pub fn main() !void {
         total_skipped,
         total_failed,
     });
+
+    if (all_skipped.items.len > 0) {
+        try stderr.print("# Skipped:\n", .{});
+        for (all_skipped.items) |s| {
+            if (s.line == 0) {
+                try stderr.print("#   {s}: {s}\n", .{ s.file, s.command });
+            } else {
+                try stderr.print("#   {s}:{d}: {s}\n", .{ s.file, s.line, s.command });
+            }
+        }
+    }
 
     if (total_failed > 0) {
         process.exit(1);

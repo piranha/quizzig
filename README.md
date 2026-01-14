@@ -41,21 +41,24 @@ quizzig [OPTIONS] [TEST_FILES...]
 
 ## Test Format
 
-Test files use `.t` extension. Lines indented with 2 spaces are test content:
+You can literally write tests as markdown files, using 4-space indented blocks for test content:
 
 ```
 Description (not indented, ignored):
 
-  $ echo hello
-  hello
+    $ echo hello
+    hello
 
-  $ echo "multi
-  > line
-  > command"
-  multi
-  line
-  command
+    $ echo "multi
+    > line
+    > command"
+    multi
+    line
+    command
 ```
+
+> [!NOTE]
+> Cram uses 2-space indents by default, you can use `quizzig --indent=2` to support old format.
 
 ### Commands
 
@@ -67,47 +70,47 @@ Indented lines after a command are expected output. Supports several matchers:
 
 **Literal** (default):
 ```
-  $ echo foo
-  foo
+    $ echo foo
+    foo
 ```
 
 **Regex** `(re)`:
 ```
-  $ date
-  \d{4}-\d{2}-\d{2}.* (re)
+    $ date
+    \d{4}-\d{2}-\d{2}.* (re)
 ```
 
 **Glob** `(glob)`:
 ```
-  $ ls *.txt
-  file?.txt (glob)
+    $ ls *.txt
+    file?.txt (glob)
 ```
 
 **Escape sequences** `(esc)`:
 ```
-  $ printf '\x00\x01'
-  \x00\x01 (esc)
+    $ printf '\x00\x01'
+    \x00\x01 (esc)
 ```
 
 **No trailing newline** `(no-eol)`:
 ```
-  $ printf foo
-  foo (no-eol)
+    $ printf foo
+    foo (no-eol)
 ```
 
 ### Exit Codes
 
 Non-zero exit codes are shown as `[N]`:
 ```
-  $ (exit 1)
-  [1]
+    $ (exit 1)
+    [1]
 ```
 
 ### Skipping Tests
 
 Exit with code 80 to skip:
 ```
-  $ [ -f /some/file ] || exit 80
+    $ [ -f /some/file ] || exit 80
 ```
 
 ## Environment
@@ -132,19 +135,19 @@ Standard locale variables (`LANG`, `LC_ALL`, `TZ`, etc.) are normalized to `C`.
 # examples/basic.t
 Basic shell tests:
 
-  $ echo hello world
-  hello world
+    $ echo hello world
+    hello world
 
-  $ seq 3
-  1
-  2
-  3
+    $ seq 3
+    1
+    2
+    3
 
-  $ ls *.md
-  README.md (glob)
+    $ ls *.md
+    README.md (glob)
 
-  $ (exit 42)
-  [42]
+    $ (exit 42)
+    [42]
 ```
 
 Run:

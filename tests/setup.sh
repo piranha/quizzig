@@ -5,9 +5,9 @@
 
 # Use quizzig from ROOTDIR build, or fall back to PATH
 if [ -x "$ROOTDIR/zig-out/bin/quizzig" ]; then
-  alias quizzig="$ROOTDIR/zig-out/bin/quizzig --shell=$TESTSHELL"
+    alias quizzig="$ROOTDIR/zig-out/bin/quizzig --shell=$TESTSHELL"
 else
-  alias quizzig="quizzig --shell=$TESTSHELL"
+    alias quizzig="quizzig --shell=$TESTSHELL"
 fi
 
 command -v md5 > /dev/null || alias md5=md5sum

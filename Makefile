@@ -10,8 +10,8 @@ release:
 
 test: build
 	zig build test
-	./zig-out/bin/quizzig examples/advanced.t examples/bare.t examples/basic.t examples/empty.t examples/env.t examples/missingeol.t examples/skip.t examples/test.t
-	! ./zig-out/bin/quizzig examples/fail.t
+	./zig-out/bin/quizzig examples/advanced.md examples/bare.md examples/basic.md examples/empty.md examples/env.md examples/missingeol.md examples/skip.md examples/test.md
+	! ./zig-out/bin/quizzig examples/fail.md 2>&1 > /dev/null
 	./zig-out/bin/quizzig --bindir ./zig-out/bin tests/
 
 clean:
