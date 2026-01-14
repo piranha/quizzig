@@ -1,8 +1,14 @@
 # quizzig
 
-A shell testing framework written in Zig. Inspired by [cram](https://bitheap.org/cram/).
+A shell testing framework. Inspired by [cram](https://bitheap.org/cram/).
 
 Write tests that look like shell sessions, quizzig runs them and diffs the output.
+
+## Why
+
+Cram is in Python, which means you need to have Python and have to survive
+Python's load time etc. Quizzig is written in Zig, so startup is quick and it's
+distributed as a single small binary.
 
 ## Installation
 
