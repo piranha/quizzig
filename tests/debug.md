@@ -4,8 +4,8 @@ Set up quizzig alias:
 
 Debug mode outputs directly to terminal:
 
-    $ printf '  $ echo hi\n  > echo bye' > debug.t
-    $ quizzig -d debug.t
+    $ printf '    $ echo hi\n    > echo bye' > debug.md
+    $ quizzig -d debug.md
     hi
     bye
     .
@@ -13,6 +13,9 @@ Debug mode outputs directly to terminal:
 
 Debug mode with empty test:
 
-    $ quizzig -d examples/empty.t
-    s
+    $ quizzig -v examples/empty.md
+    examples/empty.md: s
+    
     # Ran 0 tests, 1 skipped, 0 failed.
+    # Skipped:
+    #   examples/empty.md: (no commands)

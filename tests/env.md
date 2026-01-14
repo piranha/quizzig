@@ -5,8 +5,8 @@ Set up quizzig alias:
 Test ROOTDIR environment variable:
 
     $ cat > rootdir.t <<EOF
-    >   $ echo "\$ROOTDIR" | grep -q / && echo "has path"
-    >   has path
+    >     $ echo "\$ROOTDIR" | grep -q / && echo "has path"
+    >     has path
     > EOF
     $ quizzig rootdir.t
     .
@@ -15,8 +15,8 @@ Test ROOTDIR environment variable:
 Test --env flag:
 
     $ cat > envtest.t <<EOF
-    >   $ echo "\$MYVAR"
-    >   hello
+    >     $ echo "\$MYVAR"
+    >     hello
     > EOF
     $ quizzig -e MYVAR=hello envtest.t
     .
@@ -25,8 +25,8 @@ Test --env flag:
 Test --env overrides inherited:
 
     $ cat > envoverride.t <<EOF
-    >   $ echo "\$HOME"
-    >   custom
+    >     $ echo "\$HOME"
+    >     custom
     > EOF
     $ quizzig -E -e HOME=custom envoverride.t
     .
@@ -41,8 +41,8 @@ Test --bindir prepends to PATH:
     > EOF
     $ chmod +x mybin/mytool
     $ cat > bintest.t <<EOF
-    >   $ mytool
-    >   mytool works
+    >     $ mytool
+    >     mytool works
     > EOF
     $ quizzig --bindir=mybin bintest.t
     .
@@ -55,8 +55,8 @@ Test multiple --bindir (last wins = first in PATH):
     $ printf '#!/bin/sh\necho bin2' > bin2/tool
     $ chmod +x bin1/tool bin2/tool
     $ cat > multibin.t <<EOF
-    >   $ tool
-    >   bin2
+    >     $ tool
+    >     bin2
     > EOF
     $ quizzig --bindir=bin1 --bindir=bin2 multibin.t
     .
@@ -65,16 +65,16 @@ Test multiple --bindir (last wins = first in PATH):
 Test -E inherits environment:
 
     $ cat > inherit.t <<EOF
-    >   $ echo "\$QUIZZIG"
-    >   1
+    >     $ echo "\$QUIZZIG"
+    >     1
     > EOF
     $ MYTEST=inherited quizzig inherit.t
     .
     # Ran 1 tests, 0 skipped, 0 failed.
 
     $ cat > inherit2.t <<EOF
-    >   $ echo "\$MYTEST"
-    >   inherited
+    >     $ echo "\$MYTEST"
+    >     inherited
     > EOF
     $ MYTEST=inherited quizzig -E inherit2.t
     .
@@ -83,10 +83,10 @@ Test -E inherits environment:
 Default PATH includes standard directories:
 
     $ cat > path.t <<EOF
-    >   $ echo "\$PATH" | tr ':' '\n' | head -3
-    >   /usr/local/bin
-    >   /usr/bin
-    >   /bin
+    >     $ echo "\$PATH" | tr ':' '\n' | head -3
+    >     /usr/local/bin
+    >     /usr/bin
+    >     /bin
     > EOF
     $ quizzig path.t
     .

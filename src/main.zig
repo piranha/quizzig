@@ -613,17 +613,34 @@ pub fn generateDiff(
             const act = actual_lines.items[ai];
 
             if (try matchLine(exp, act, allocator)) {
-                try diff.append(allocator, .{ .prefix = ' ', .content = act });
+                try diff.append(allocator, .{ .prefix = ' ', .content = exp.original });
                 ei += 1;
                 ai += 1;
             } else {
-                try diff.append(allocator, .{ .prefix = '-', .content = exp.text });
-                try diff.append(allocator, .{ .prefix = '+', .content = act });
-                ei += 1;
-                ai += 1;
+                // Collect consecutive mismatches, then output grouped (all - then all +)
+                var removed: std.ArrayListUnmanaged([]const u8) = .{};
+                var added: std.ArrayListUnmanaged([]const u8) = .{};
+
+                while (ei < expected_lines.len and ai < actual_lines.items.len) {
+                    const e = expected_lines[ei];
+                    const a = actual_lines.items[ai];
+                    if (try matchLine(e, a, allocator)) break;
+                    try removed.append(allocator, e.original);
+                    try added.append(allocator, a);
+                    ei += 1;
+                    ai += 1;
+                }
+
+                // Output all removals first, then all additions
+                for (removed.items) |line| {
+                    try diff.append(allocator, .{ .prefix = '-', .content = line });
+                }
+                for (added.items) |line| {
+                    try diff.append(allocator, .{ .prefix = '+', .content = line });
+                }
             }
         } else if (ei < expected_lines.len) {
-            try diff.append(allocator, .{ .prefix = '-', .content = expected_lines[ei].text });
+            try diff.append(allocator, .{ .prefix = '-', .content = expected_lines[ei].original });
             ei += 1;
         } else if (ai < actual_lines.items.len) {
             try diff.append(allocator, .{ .prefix = '+', .content = actual_lines.items[ai] });
@@ -644,13 +661,32 @@ pub fn hasDifferences(diff: []const DiffLine) bool {
     return false;
 }
 
-fn isPrintable(s: []const u8) bool {
-    for (s) |c| {
-        // Allow tab as printable-ish (common in text)
-        if (c == '\t') continue;
-        if (c < 0x20 or c >= 0x7f) return false;
+fn needsEscaping(s: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        // Control chars (except tab) need escaping
+        if (c < 0x20 and c != '\t') return true;
+        if (c == 0x7f) return true;
+        // ASCII printable is fine
+        if (c < 0x80) {
+            i += 1;
+            continue;
+        }
+        // Check for valid UTF-8 sequence
+        const seq_len: usize = if (c < 0xc0) 0 // Invalid leading byte
+        else if (c < 0xe0) 2
+        else if (c < 0xf0) 3
+        else if (c < 0xf8) 4
+        else 0; // Invalid
+        if (seq_len == 0 or i + seq_len > s.len) return true; // Invalid UTF-8
+        // Verify continuation bytes (must be 10xxxxxx)
+        for (s[i + 1 .. i + seq_len]) |cont| {
+            if (cont < 0x80 or cont >= 0xc0) return true; // Invalid continuation
+        }
+        i += seq_len;
     }
-    return true;
+    return false;
 }
 
 // Test file runner
@@ -722,9 +758,18 @@ pub fn runTestFile(
     var skipped: usize = 0;
     var skipped_tests: std.ArrayListUnmanaged(SkippedTest) = .{};
 
+    // Collect all diff output for this file
+    var diff_output: std.ArrayListUnmanaged(u8) = .{};
+    defer diff_output.deinit(allocator);
+
     for (commands.items, 0..) |cmd, i| {
         if (i >= results.items.len) {
+            // No result for this command - shell may have hung or crashed
             failed += 1;
+            if (!opts.quiet) {
+                try diff_output.writer(allocator).print("@@ -{d},0 +{d},1 @@\n", .{ cmd.line_num, cmd.line_num });
+                try diff_output.appendSlice(allocator, "+  (no output captured - shell may have hung)\n");
+            }
             continue;
         }
 
@@ -748,10 +793,6 @@ pub fn runTestFile(
             failed += 1;
 
             if (!opts.quiet) {
-                const out = getStdout();
-                // Proper unified diff header
-                try out.print("--- {s}\n+++ {s}\n", .{ path, path });
-
                 // Calculate line numbers: expected output starts after command lines
                 const start_line = cmd.line_num + cmd.lines.items.len;
 
@@ -763,24 +804,68 @@ pub fn runTestFile(
                     if (line.prefix == '+' or line.prefix == ' ') new_count += 1;
                 }
 
+                // Check if we need trailing context (patch needs it to avoid fuzz)
+                var trailing_context: ?[]const u8 = null;
+                if (diff.items.len > 0 and diff.items[diff.items.len - 1].prefix != ' ') {
+                    // Diff ends with +/-, try to get next line from file as context
+                    const next_line_idx = start_line - 1 + old_count; // 0-indexed
+                    if (next_line_idx < parser.lines.items.len) {
+                        const next_line = parser.lines.items[next_line_idx];
+                        // Skip if this is the phantom empty line at EOF (artifact of splitScalar)
+                        const is_eof_phantom = next_line_idx == parser.lines.items.len - 1 and next_line.len == 0;
+                        if (!is_eof_phantom) {
+                            const line_type = parser.lineType(next_line);
+                            // Use output lines, or empty/comment lines (for blank line separators)
+                            if (line_type == .output) {
+                                trailing_context = next_line[opts.indent..];
+                                old_count += 1;
+                                new_count += 1;
+                            } else if (line_type == .comment and next_line.len == 0) {
+                                // Empty line - use as-is (empty trailing context)
+                                trailing_context = "";
+                                old_count += 1;
+                                new_count += 1;
+                            }
+                        }
+                    }
+                }
+
                 // Hunk header
-                try out.print("@@ -{d},{d} +{d},{d} @@\n", .{ start_line, old_count, start_line, new_count });
+                try diff_output.writer(allocator).print("@@ -{d},{d} +{d},{d} @@\n", .{ start_line, old_count, start_line, new_count });
 
                 // Output diff lines with indentation
-                const indent = "  "; // 2-space indent for .t files
+                const indent = "    "; // Match file indent
                 for (diff.items) |line| {
-                    if (isPrintable(line.content)) {
-                        try out.print("{c}{s}{s}\n", .{ line.prefix, indent, line.content });
-                    } else {
+                    // Only escape added lines with control chars or invalid UTF-8
+                    // Context/removal must match file exactly (no escaping)
+                    if (line.prefix == '+' and needsEscaping(line.content)) {
                         const escaped = try escapeOutput(allocator, line.content);
                         defer allocator.free(escaped);
-                        try out.print("{c}{s}{s} (esc)\n", .{ line.prefix, indent, escaped });
+                        try diff_output.writer(allocator).print("{c}{s}{s} (esc)\n", .{ line.prefix, indent, escaped });
+                    } else {
+                        try diff_output.writer(allocator).print("{c}{s}{s}\n", .{ line.prefix, indent, line.content });
+                    }
+                }
+
+                // Add trailing context if needed
+                if (trailing_context) |ctx| {
+                    if (ctx.len == 0) {
+                        try diff_output.appendSlice(allocator, " \n"); // Empty context line
+                    } else {
+                        try diff_output.writer(allocator).print(" {s}{s}\n", .{ indent, ctx });
                     }
                 }
             }
         } else {
             passed += 1;
         }
+    }
+
+    // Output collected diff with single header
+    if (diff_output.items.len > 0) {
+        const out = getStdout();
+        try out.print("--- {s}\n+++ {s}\n", .{ path, path });
+        try out.print("{s}", .{diff_output.items});
     }
 
     return .{
@@ -842,7 +927,7 @@ fn findTestFiles(allocator: Allocator, paths: []const []const u8) !std.ArrayList
             defer walker.deinit();
 
             while (try walker.next()) |entry| {
-                if (entry.kind == .file and mem.endsWith(u8, entry.basename, ".t")) {
+                if (entry.kind == .file and (mem.endsWith(u8, entry.basename, ".t") or mem.endsWith(u8, entry.basename, ".md"))) {
                     if (entry.basename[0] == '.') continue;
                     const full_path = try fs.path.join(allocator, &.{ path, entry.path });
                     try test_files.append(allocator, full_path);
@@ -1062,7 +1147,7 @@ pub fn main() !void {
         total_failed,
     });
 
-    if (all_skipped.items.len > 0) {
+    if (all_skipped.items.len > 0 and opts.verbose) {
         try stderr.print("# Skipped:\n", .{});
         for (all_skipped.items) |s| {
             if (s.line == 0) {
