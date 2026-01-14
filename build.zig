@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const version = b.option([]const u8, "version", "Version string") orelse "dev";
     const output = b.option([]const u8, "output", "Custom output path (e.g., dist/quizzig-Linux-x86_64)");
 
     // Get PCRE2 dependency (builds itself)
@@ -12,6 +13,9 @@ pub fn build(b: *std.Build) void {
     });
     const pcre2_lib = pcre2_dep.artifact("pcre2-8");
 
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+
     // Main executable
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -19,6 +23,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = optimize != .Debug,
     });
+    exe_mod.addOptions("build_options", build_options);
 
     const exe = b.addExecutable(.{
         .name = "quizzig",

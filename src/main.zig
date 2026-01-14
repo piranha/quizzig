@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const fs = std.fs;
 const mem = std.mem;
 const process = std.process;
@@ -10,7 +11,7 @@ const pcre2 = @cImport({
     @cInclude("pcre2.h");
 });
 
-pub const version = "0.1.0";
+pub const version = build_options.version;
 
 // Line types in a .t file
 pub const LineType = enum {
@@ -586,7 +587,7 @@ pub fn generateDiff(
 
     var actual_lines: std.ArrayListUnmanaged([]const u8) = .{};
     // actual_lines memory is managed by arena
-    
+
     if (actual.len > 0) {
         var iter = mem.splitScalar(u8, actual, '\n');
         while (iter.next()) |line| {

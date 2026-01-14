@@ -1,6 +1,7 @@
 .{
     .name = .quizzig,
-    .version = "0.1.0",
+    // no idea how to sync this with tags used for releases
+    .version = "0.0.0",
     .fingerprint = 0x22b304c4e0485cba,
     .dependencies = .{
         .pcre2 = .{
