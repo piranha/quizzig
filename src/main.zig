@@ -654,6 +654,112 @@ pub fn generateDiff(
     };
 }
 
+pub const Hunk = struct {
+    start_idx: usize, // index into original diff lines
+    end_idx: usize, // exclusive
+    old_start: usize, // 1-based line number in old file
+    old_count: usize,
+    new_count: usize,
+};
+
+const CONTEXT_LINES = 3;
+
+const Range = struct { start: usize, end: usize };
+
+/// Convert flat diff lines into hunks with limited context (3 lines before/after changes)
+pub fn generateHunks(allocator: Allocator, diff: []const DiffLine) !std.ArrayListUnmanaged(Hunk) {
+    var hunks: std.ArrayListUnmanaged(Hunk) = .{};
+
+    if (diff.len == 0) return hunks;
+
+    // Find all change positions (non-context lines)
+    var change_ranges: std.ArrayListUnmanaged(Range) = .{};
+    defer change_ranges.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < diff.len) {
+        if (diff[i].prefix != ' ') {
+            const start = i;
+            while (i < diff.len and diff[i].prefix != ' ') : (i += 1) {}
+            try change_ranges.append(allocator, .{ .start = start, .end = i });
+        } else {
+            i += 1;
+        }
+    }
+
+    if (change_ranges.items.len == 0) return hunks;
+
+    // Merge change ranges that are within 2*CONTEXT_LINES of each other
+    var merged: std.ArrayListUnmanaged(Range) = .{};
+    defer merged.deinit(allocator);
+
+    var current = change_ranges.items[0];
+    for (change_ranges.items[1..]) |next| {
+        // If gap between end of current and start of next is <= 2*CONTEXT_LINES, merge
+        if (next.start <= current.end + 2 * CONTEXT_LINES) {
+            current.end = next.end;
+        } else {
+            try merged.append(allocator, current);
+            current = next;
+        }
+    }
+    try merged.append(allocator, current);
+
+    // Convert merged ranges to hunks with context
+    var old_line: usize = 1; // 1-based line number tracking
+    var diff_idx: usize = 0;
+
+    for (merged.items) |range| {
+        // Advance old_line to account for lines before this range
+        while (diff_idx < range.start) {
+            if (diff[diff_idx].prefix == ' ' or diff[diff_idx].prefix == '-') {
+                old_line += 1;
+            }
+            diff_idx += 1;
+        }
+
+        // Calculate context bounds
+        const ctx_start = if (range.start >= CONTEXT_LINES) range.start - CONTEXT_LINES else 0;
+        const ctx_end = @min(range.end + CONTEXT_LINES, diff.len);
+
+        // Calculate old_start (need to back up for leading context)
+        var hunk_old_start = old_line;
+        var back: usize = range.start;
+        while (back > ctx_start) {
+            back -= 1;
+            if (diff[back].prefix == ' ' or diff[back].prefix == '-') {
+                hunk_old_start -= 1;
+            }
+        }
+
+        // Count old/new lines in hunk
+        var old_count: usize = 0;
+        var new_count: usize = 0;
+        for (diff[ctx_start..ctx_end]) |line| {
+            if (line.prefix == ' ' or line.prefix == '-') old_count += 1;
+            if (line.prefix == ' ' or line.prefix == '+') new_count += 1;
+        }
+
+        try hunks.append(allocator, .{
+            .start_idx = ctx_start,
+            .end_idx = ctx_end,
+            .old_start = hunk_old_start,
+            .old_count = old_count,
+            .new_count = new_count,
+        });
+
+        // Advance to end of this range
+        while (diff_idx < range.end) {
+            if (diff[diff_idx].prefix == ' ' or diff[diff_idx].prefix == '-') {
+                old_line += 1;
+            }
+            diff_idx += 1;
+        }
+    }
+
+    return hunks;
+}
+
 pub fn hasDifferences(diff: []const DiffLine) bool {
     for (diff) |line| {
         if (line.prefix != ' ') return true;
@@ -712,7 +818,7 @@ pub fn runTestFile(
     if (commands.items.len == 0) {
         var skipped_tests: std.ArrayListUnmanaged(SkippedTest) = .{};
         try skipped_tests.append(allocator, .{ .file = path, .line = 0, .command = try allocator.dupe(u8, "(no commands)") });
-        return .{ .passed = 0, .failed = 0, .skipped = 1, .skipped_tests = skipped_tests };
+        return .{ .passed = 0, .failed = 0, .skipped = 1, .skipped_tests = skipped_tests, .diff_output = "", .patched_content = null };
     }
 
     const basename = fs.path.basename(path);
@@ -758,18 +864,46 @@ pub fn runTestFile(
     var skipped: usize = 0;
     var skipped_tests: std.ArrayListUnmanaged(SkippedTest) = .{};
 
-    // Collect all diff output for this file
-    var diff_output: std.ArrayListUnmanaged(u8) = .{};
-    defer diff_output.deinit(allocator);
+    // For --patch mode: track line replacements (start_line, end_line exclusive, new_lines)
+    const Correction = struct {
+        start_line: usize, // 1-based, inclusive
+        end_line: usize, // 1-based, exclusive
+        new_lines: std.ArrayListUnmanaged([]const u8),
+    };
+    var corrections: std.ArrayListUnmanaged(Correction) = .{};
+    defer {
+        for (corrections.items) |*c| {
+            for (c.new_lines.items) |line| allocator.free(line);
+            c.new_lines.deinit(allocator);
+        }
+        corrections.deinit(allocator);
+    }
+
+    // Collect all file-level diff entries (file_line -> list of diff lines)
+    // For added lines, file_line is where they insert after
+    const FileDiffLine = struct {
+        prefix: u8,
+        content: []const u8, // owned by arena
+        is_escaped: bool,
+    };
+    var file_diff_arena = std.heap.ArenaAllocator.init(allocator);
+    defer file_diff_arena.deinit();
+    const diff_alloc = file_diff_arena.allocator();
+
+    // Map from file line (1-based) to diff lines at that position
+    // Context lines use their actual file line, changes use the old file line
+    var diff_at_line = std.AutoHashMap(usize, std.ArrayListUnmanaged(FileDiffLine)).init(allocator);
+    defer {
+        var it = diff_at_line.valueIterator();
+        while (it.next()) |list| {
+            list.deinit(allocator);
+        }
+        diff_at_line.deinit();
+    }
 
     for (commands.items, 0..) |cmd, i| {
         if (i >= results.items.len) {
-            // No result for this command - shell may have hung or crashed
             failed += 1;
-            if (!opts.quiet) {
-                try diff_output.writer(allocator).print("@@ -{d},0 +{d},1 @@\n", .{ cmd.line_num, cmd.line_num });
-                try diff_output.appendSlice(allocator, "+  (no output captured - shell may have hung)\n");
-            }
             continue;
         }
 
@@ -792,67 +926,75 @@ pub fn runTestFile(
         if (has_diff) {
             failed += 1;
 
-            if (!opts.quiet) {
-                // Calculate line numbers: expected output starts after command lines
+            // For --patch mode: record the correction
+            if (opts.patch) {
                 const start_line = cmd.line_num + cmd.lines.items.len;
+                const end_line = start_line + cmd.expected.items.len;
+                const indent_str = "    "; // TODO: use opts.indent
 
-                // Count old/new lines for hunk header
-                var old_count: usize = 0;
-                var new_count: usize = 0;
-                for (diff.items) |line| {
-                    if (line.prefix == '-' or line.prefix == ' ') old_count += 1;
-                    if (line.prefix == '+' or line.prefix == ' ') new_count += 1;
-                }
+                var new_lines: std.ArrayListUnmanaged([]const u8) = .{};
 
-                // Check if we need trailing context (patch needs it to avoid fuzz)
-                var trailing_context: ?[]const u8 = null;
-                if (diff.items.len > 0 and diff.items[diff.items.len - 1].prefix != ' ') {
-                    // Diff ends with +/-, try to get next line from file as context
-                    const next_line_idx = start_line - 1 + old_count; // 0-indexed
-                    if (next_line_idx < parser.lines.items.len) {
-                        const next_line = parser.lines.items[next_line_idx];
-                        // Skip if this is the phantom empty line at EOF (artifact of splitScalar)
-                        const is_eof_phantom = next_line_idx == parser.lines.items.len - 1 and next_line.len == 0;
-                        if (!is_eof_phantom) {
-                            const line_type = parser.lineType(next_line);
-                            // Use output lines, or empty/comment lines (for blank line separators)
-                            if (line_type == .output) {
-                                trailing_context = next_line[opts.indent..];
-                                old_count += 1;
-                                new_count += 1;
-                            } else if (line_type == .comment and next_line.len == 0) {
-                                // Empty line - use as-is (empty trailing context)
-                                trailing_context = "";
-                                old_count += 1;
-                                new_count += 1;
-                            }
-                        }
+                // Parse actual output into lines
+                if (result.output.len > 0) {
+                    var iter = mem.splitScalar(u8, result.output, '\n');
+                    while (iter.next()) |line| {
+                        // Skip trailing empty line from split
+                        if (iter.peek() == null and line.len == 0) break;
+                        const needs_esc = needsEscaping(line);
+                        const formatted = if (needs_esc) blk: {
+                            const escaped = try escapeOutput(allocator, line);
+                            defer allocator.free(escaped);
+                            break :blk try std.fmt.allocPrint(allocator, "{s}{s} (esc)", .{ indent_str, escaped });
+                        } else try std.fmt.allocPrint(allocator, "{s}{s}", .{ indent_str, line });
+                        try new_lines.append(allocator, formatted);
                     }
                 }
 
-                // Hunk header
-                try diff_output.writer(allocator).print("@@ -{d},{d} +{d},{d} @@\n", .{ start_line, old_count, start_line, new_count });
-
-                // Output diff lines with indentation
-                const indent = "    "; // Match file indent
-                for (diff.items) |line| {
-                    // Only escape added lines with control chars or invalid UTF-8
-                    // Context/removal must match file exactly (no escaping)
-                    if (line.prefix == '+' and needsEscaping(line.content)) {
-                        const escaped = try escapeOutput(allocator, line.content);
-                        defer allocator.free(escaped);
-                        try diff_output.writer(allocator).print("{c}{s}{s} (esc)\n", .{ line.prefix, indent, escaped });
-                    } else {
-                        try diff_output.writer(allocator).print("{c}{s}{s}\n", .{ line.prefix, indent, line.content });
-                    }
+                // Add exit code line if non-zero
+                if (result.exit_code != 0) {
+                    const exit_line = try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ indent_str, result.exit_code });
+                    try new_lines.append(allocator, exit_line);
                 }
 
-                // Add trailing context if needed
-                if (trailing_context) |ctx| {
-                    if (ctx.len == 0) {
-                        try diff_output.appendSlice(allocator, " \n"); // Empty context line
-                    } else {
-                        try diff_output.writer(allocator).print(" {s}{s}\n", .{ indent, ctx });
+                try corrections.append(allocator, .{
+                    .start_line = start_line,
+                    .end_line = end_line,
+                    .new_lines = new_lines,
+                });
+            }
+
+            if (!opts.quiet) {
+                const start_line = cmd.line_num + cmd.lines.items.len;
+                const indent = "    ";
+
+                // Track file line as we walk through diff
+                // Additions (+) stay at same position as preceding removal/context
+                var file_line = start_line;
+                var store_at = start_line;
+                for (diff.items) |line| {
+                    if (line.prefix != '+') {
+                        store_at = file_line;
+                    }
+
+                    const needs_esc = line.prefix == '+' and needsEscaping(line.content);
+                    const line_content = if (needs_esc)
+                        try std.fmt.allocPrint(diff_alloc, "{s}{s} (esc)", .{ indent, try escapeOutput(diff_alloc, line.content) })
+                    else
+                        try std.fmt.allocPrint(diff_alloc, "{s}{s}", .{ indent, line.content });
+
+                    const entry = try diff_at_line.getOrPut(store_at);
+                    if (!entry.found_existing) {
+                        entry.value_ptr.* = .{};
+                    }
+                    try entry.value_ptr.append(allocator, .{
+                        .prefix = line.prefix,
+                        .content = line_content,
+                        .is_escaped = needs_esc,
+                    });
+
+                    // Advance file_line for context and removed lines (not added)
+                    if (line.prefix != '+') {
+                        file_line += 1;
                     }
                 }
             }
@@ -861,11 +1003,156 @@ pub fn runTestFile(
         }
     }
 
-    // Output collected diff with single header
-    if (diff_output.items.len > 0) {
-        const out = getStdout();
-        try out.print("--- {s}\n+++ {s}\n", .{ path, path });
-        try out.print("{s}", .{diff_output.items});
+    // Generate merged hunks from collected diff data
+    if (diff_at_line.count() > 0 and !opts.quiet) {
+        // Get sorted list of file lines that have changes
+        var change_lines: std.ArrayListUnmanaged(usize) = .{};
+        defer change_lines.deinit(allocator);
+
+        var kit = diff_at_line.keyIterator();
+        while (kit.next()) |key| {
+            // Only include lines that have actual changes (not just context)
+            const lines = diff_at_line.get(key.*).?;
+            for (lines.items) |line| {
+                if (line.prefix != ' ') {
+                    try change_lines.append(allocator, key.*);
+                    break;
+                }
+            }
+        }
+
+        if (change_lines.items.len > 0) {
+            std.mem.sort(usize, change_lines.items, {}, std.sort.asc(usize));
+
+            // Merge into ranges with context
+            var ranges: std.ArrayListUnmanaged(Range) = .{};
+            defer ranges.deinit(allocator);
+
+            var current_start = if (change_lines.items[0] > CONTEXT_LINES) change_lines.items[0] - CONTEXT_LINES else 1;
+            var current_end = change_lines.items[0] + CONTEXT_LINES + 1;
+
+            for (change_lines.items[1..]) |line| {
+                const range_start = if (line > CONTEXT_LINES) line - CONTEXT_LINES else 1;
+                const range_end = line + CONTEXT_LINES + 1;
+
+                if (range_start <= current_end) {
+                    // Overlaps or touches, extend
+                    current_end = @max(current_end, range_end);
+                } else {
+                    // Gap, save current and start new
+                    try ranges.append(allocator, .{ .start = current_start, .end = current_end });
+                    current_start = range_start;
+                    current_end = range_end;
+                }
+            }
+            try ranges.append(allocator, .{ .start = current_start, .end = current_end });
+
+            // Collect diff output to buffer
+            var diff_output: std.ArrayListUnmanaged(u8) = .{};
+            errdefer diff_output.deinit(allocator);
+
+            try diff_output.writer(allocator).print("--- {s}\n+++ {s}\n", .{ path, path });
+
+            for (ranges.items) |range| {
+                // Collect lines for this hunk
+                var old_count: usize = 0;
+                var new_count: usize = 0;
+                var hunk_content: std.ArrayListUnmanaged(u8) = .{};
+                defer hunk_content.deinit(allocator);
+
+                var line_num = range.start;
+                while (line_num < range.end) {
+                    if (diff_at_line.get(line_num)) |diff_lines| {
+                        // Output diff lines at this position
+                        for (diff_lines.items) |dl| {
+                            try hunk_content.writer(allocator).print("{c}{s}\n", .{ dl.prefix, dl.content });
+                            if (dl.prefix == ' ' or dl.prefix == '-') old_count += 1;
+                            if (dl.prefix == ' ' or dl.prefix == '+') new_count += 1;
+                        }
+                        // Check if we consumed a file line (context or removal)
+                        var consumed = false;
+                        for (diff_lines.items) |dl| {
+                            if (dl.prefix != '+') {
+                                consumed = true;
+                                break;
+                            }
+                        }
+                        if (consumed) {
+                            line_num += 1;
+                        } else {
+                            line_num += 1;
+                        }
+                    } else {
+                        // No diff at this line, emit as context from file
+                        const file_idx = line_num - 1;
+                        if (file_idx < parser.lines.items.len) {
+                            const file_line = parser.lines.items[file_idx];
+                            const is_eof_phantom = file_idx == parser.lines.items.len - 1 and file_line.len == 0;
+                            if (!is_eof_phantom) {
+                                try hunk_content.writer(allocator).print(" {s}\n", .{file_line});
+                                old_count += 1;
+                                new_count += 1;
+                            }
+                        }
+                        line_num += 1;
+                    }
+                }
+
+                try diff_output.writer(allocator).print("@@ -{d},{d} +{d},{d} @@\n", .{ range.start, old_count, range.start, new_count });
+                try diff_output.appendSlice(allocator, hunk_content.items);
+            }
+
+            // Generate patched content if in patch mode
+            const patched = if (opts.patch and corrections.items.len > 0) blk: {
+                var patched_content: std.ArrayListUnmanaged(u8) = .{};
+                var src_line: usize = 1;
+
+                // Sort corrections by start_line
+                std.mem.sort(Correction, corrections.items, {}, struct {
+                    fn lessThan(_: void, a: Correction, b: Correction) bool {
+                        return a.start_line < b.start_line;
+                    }
+                }.lessThan);
+
+                for (corrections.items) |corr| {
+                    // Copy lines before this correction
+                    while (src_line < corr.start_line) : (src_line += 1) {
+                        const idx = src_line - 1;
+                        if (idx < parser.lines.items.len) {
+                            try patched_content.appendSlice(allocator, parser.lines.items[idx]);
+                            try patched_content.append(allocator, '\n');
+                        }
+                    }
+                    // Insert corrected lines
+                    for (corr.new_lines.items) |new_line| {
+                        try patched_content.appendSlice(allocator, new_line);
+                        try patched_content.append(allocator, '\n');
+                    }
+                    // Skip old expected output lines
+                    src_line = corr.end_line;
+                }
+                // Copy remaining lines
+                while (src_line <= parser.lines.items.len) : (src_line += 1) {
+                    const idx = src_line - 1;
+                    if (idx < parser.lines.items.len) {
+                        try patched_content.appendSlice(allocator, parser.lines.items[idx]);
+                        if (src_line < parser.lines.items.len) {
+                            try patched_content.append(allocator, '\n');
+                        }
+                    }
+                }
+                break :blk try patched_content.toOwnedSlice(allocator);
+            } else null;
+
+            return .{
+                .passed = passed,
+                .failed = failed,
+                .skipped = skipped,
+                .skipped_tests = skipped_tests,
+                .diff_output = try diff_output.toOwnedSlice(allocator),
+                .patched_content = patched,
+            };
+        }
     }
 
     return .{
@@ -873,6 +1160,8 @@ pub fn runTestFile(
         .failed = failed,
         .skipped = skipped,
         .skipped_tests = skipped_tests,
+        .diff_output = "",
+        .patched_content = null,
     };
 }
 
@@ -887,6 +1176,8 @@ pub const TestFileResult = struct {
     failed: usize,
     skipped: usize,
     skipped_tests: std.ArrayListUnmanaged(SkippedTest),
+    diff_output: []const u8, // owned, caller must free
+    patched_content: ?[]const u8, // if patch mode, the corrected file content
 };
 
 pub const EnvVar = struct {
@@ -899,7 +1190,7 @@ pub const Options = struct {
     indent: usize = 4,
     quiet: bool = false,
     verbose: bool = false,
-    interactive: bool = false,
+    patch: bool = false,
     debug: bool = false,
     inherit_env: bool = false,
     keep_tmpdir: bool = false,
@@ -975,7 +1266,7 @@ fn printUsage() void {
         \\  -V, --version        Show version
         \\  -q, --quiet          Don't print diffs
         \\  -v, --verbose        Show filenames and status
-        \\  -i, --interactive    Interactively update tests
+        \\  -i, --patch          Auto-apply fixes to test files
         \\  -d, --debug          Write output directly to terminal
         \\  --keep-tmpdir        Don't remove temp directories
         \\  --shell=PATH         Shell to use (default: /bin/sh)
@@ -1031,8 +1322,8 @@ pub fn main() !void {
             opts.quiet = true;
         } else if (mem.eql(u8, arg, "-v") or mem.eql(u8, arg, "--verbose")) {
             opts.verbose = true;
-        } else if (mem.eql(u8, arg, "-i") or mem.eql(u8, arg, "--interactive")) {
-            opts.interactive = true;
+        } else if (mem.eql(u8, arg, "-i") or mem.eql(u8, arg, "--patch")) {
+            opts.patch = true;
         } else if (mem.eql(u8, arg, "-d") or mem.eql(u8, arg, "--debug")) {
             opts.debug = true;
         } else if (mem.eql(u8, arg, "--keep-tmpdir")) {
@@ -1107,6 +1398,8 @@ pub fn main() !void {
         for (all_skipped.items) |s| allocator.free(s.command);
         all_skipped.deinit(allocator);
     }
+    var all_diffs: std.ArrayListUnmanaged(u8) = .{};
+    defer all_diffs.deinit(allocator);
 
     for (test_files.items) |test_path| {
         if (opts.verbose) {
@@ -1122,13 +1415,32 @@ pub fn main() !void {
             continue;
         };
         defer result.skipped_tests.deinit(allocator);
+        defer if (result.diff_output.len > 0) allocator.free(result.diff_output);
+        defer if (result.patched_content) |p| allocator.free(p);
 
         total_passed += result.passed;
         total_failed += result.failed;
         total_skipped += result.skipped;
         try all_skipped.appendSlice(allocator, result.skipped_tests.items);
 
-        if (result.failed > 0) {
+        // Write patched content if in patch mode
+        if (result.patched_content) |patched| {
+            var file = try fs.cwd().createFile(test_path, .{});
+            defer file.close();
+            try file.writeAll(patched);
+            // Treat patched files as "fixed" - adjust counts
+            total_failed -= result.failed;
+            total_passed += result.failed;
+        }
+
+        // Collect diff output to print after progress
+        if (result.diff_output.len > 0 and !opts.patch) {
+            try all_diffs.appendSlice(allocator, result.diff_output);
+        }
+
+        if (result.patched_content != null) {
+            try stderr.print("P", .{}); // Patched
+        } else if (result.failed > 0) {
             try stderr.print("!", .{});
         } else if (result.skipped > 0 and result.passed == 0) {
             try stderr.print("s", .{});
@@ -1139,6 +1451,13 @@ pub fn main() !void {
         if (opts.verbose) {
             try stderr.print("\n", .{});
         }
+    }
+
+    // Print all diffs after progress indicators
+    if (all_diffs.items.len > 0) {
+        try stderr.print("\n", .{});
+        const stdout = getStdout();
+        try stdout.print("{s}", .{all_diffs.items});
     }
 
     try stderr.print("\n# Ran {d} tests, {d} skipped, {d} failed.\n", .{

@@ -15,12 +15,14 @@ Test with Latin-1 encoding:
     > EOF
 
     $ quizzig good-latin-1.t bad-latin-1.t
+    !.
     --- bad-latin-1.t
     +++ bad-latin-1.t
-    @@ -2,1 +2,1 @@
+    @@ -1,2 +1,2 @@
+         $ printf "hola se\361or\n"
     -    hey
     +    hola se\xf1or (esc)
-    !.
+    
     # Ran 2 tests, 0 skipped, 1 failed.
     [1]
 
@@ -37,12 +39,14 @@ Test with UTF-8 encoding:
     > EOF
 
     $ quizzig good-utf-8.t bad-utf-8.t
+    !.
     --- bad-utf-8.t
     +++ bad-utf-8.t
-    @@ -2,1 +2,1 @@
+    @@ -1,2 +1,2 @@
+         $ printf "hola se\303\261or\n"
     -    hey
-    +    hola se\xc3\xb1or (esc)
-    !.
+    +    hola señor
+    
     # Ran 2 tests, 0 skipped, 1 failed.
     [1]
 
@@ -55,10 +59,12 @@ Test file missing trailing newline:
 
     $ printf '    $ false' > failing-with-no-newline.t
     $ quizzig failing-with-no-newline.t
+    !
     --- failing-with-no-newline.t
     +++ failing-with-no-newline.t
-    @@ -2,0 +2,1 @@
+    @@ -1,1 +1,2 @@
+         $ false
     +    [1]
-    !
+    
     # Ran 1 tests, 0 skipped, 1 failed.
     [1]

@@ -14,15 +14,29 @@ Create a test file with wrong expected output:
 Run quizzig and verify it fails:
 
     $ quizzig test.md; echo "exit: $?"
+    !
     --- test.md
     +++ test.md
-    @@ -4,1 +4,1 @@
+    @@ -1,6 +1,6 @@
+     Test:
+     
+         $ echo hello
     -    wrong
     +    hello
-    @@ -6,1 +6,1 @@
+         $ echo world
     -    also wrong
     +    world
-    !
+    
+    # Ran 2 tests, 0 skipped, 2 failed.
+    exit: 1
+
+         $ echo hello
+    -    wrong
+    +    hello
+         $ echo world
+    -    also wrong
+    +    world
+
     # Ran 2 tests, 0 skipped, 2 failed.
     exit: 1
 
@@ -56,15 +70,29 @@ Test with UTF-8 content (box drawings, accented chars):
     > EOF
 
     $ quizzig utf8.md; echo "exit: $?"
+    !
     --- utf8.md
     +++ utf8.md
-    @@ -4,1 +4,1 @@
+    @@ -1,6 +1,6 @@
+     Test UTF-8:
+     
+         $ printf "── hello ──\n"
     -    wrong
     +    ── hello ──
-    @@ -6,1 +6,1 @@
+         $ printf "café\n"
     -    also wrong
     +    café
-    !
+    
+    # Ran 2 tests, 0 skipped, 2 failed.
+    exit: 1
+
+         $ printf "── hello ──\n"
+    -    wrong
+    +    ── hello ──
+         $ printf "café\n"
+    -    also wrong
+    +    café
+
     # Ran 2 tests, 0 skipped, 2 failed.
     exit: 1
 

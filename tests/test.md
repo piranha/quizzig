@@ -41,11 +41,13 @@ Test that a simple passing test works:
 
     $ echo "    $ echo 1" > simple.md
     $ quizzig -E simple.md
+    !
     --- simple.md
     +++ simple.md
-    @@ -2,0 +2,1 @@
+    @@ -1,1 +1,2 @@
+         $ echo 1
     +    1
-    !
+    
     # Ran 1 tests, 0 skipped, 1 failed.
     [1]
     $ printf "    $ echo 1\n    1\n" > simple.md
@@ -80,14 +82,17 @@ Test running tests with the same filename in different directories:
     >     $ echo 2
     > EOF
     $ quizzig -E subdir1 subdir2
+    !!
     --- subdir1/test.md
     +++ subdir1/test.md
-    @@ -2,0 +2,1 @@
+    @@ -1,1 +1,2 @@
+         $ echo 1
     +    1
-    !--- subdir2/test.md
+    --- subdir2/test.md
     +++ subdir2/test.md
-    @@ -2,0 +2,1 @@
+    @@ -1,1 +1,2 @@
+         $ echo 2
     +    2
-    !
+    
     # Ran 2 tests, 0 skipped, 2 failed.
     [1]
