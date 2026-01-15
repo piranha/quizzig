@@ -182,7 +182,7 @@ $ quizzig -E -e DEBUG=1 tests/*.t
 Requires Zig 0.15+. PCRE2 is fetched and compiled automatically.
 
 ```sh
-zig build              # Debug build
-zig build -Doptimize=ReleaseFast  # Release build
-zig build test         # Run unit tests
+make          # Debug build
+make release  # Release build
+make test     # Run tests
 ```
