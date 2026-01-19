@@ -1,4 +1,5 @@
 const std = @import("std");
+const opt = @import("opt");
 const build_options = @import("build_options");
 const fs = std.fs;
 const mem = std.mem;
@@ -1195,10 +1196,42 @@ pub const Options = struct {
     inherit_env: bool = false,
     keep_tmpdir: bool = false,
     xunit_file: ?[]const u8 = null,
-    // Collected from CLI, stored externally due to allocation
     bindirs: []const []const u8 = &.{},
     env_vars: []const EnvVar = &.{},
     rootdir: []const u8 = ".",
+};
+
+const CliOptions = struct {
+    shell: []const u8 = "/bin/sh",
+    indent: usize = 4,
+    quiet: bool = false,
+    verbose: bool = false,
+    patch: bool = false,
+    debug: bool = false,
+    @"inherit-env": bool = false,
+    @"keep-tmpdir": bool = false,
+    bindir: opt.Multi([]const u8, 16) = .{},
+    env: opt.Multi([]const u8, 32) = .{},
+    version: bool = false,
+
+    pub const meta = .{
+        .shell = .{ .help = "Shell to use" },
+        .indent = .{ .help = "Indentation spaces" },
+        .quiet = .{ .short = 'q', .help = "Don't print diffs" },
+        .verbose = .{ .short = 'v', .help = "Show filenames and status" },
+        .patch = .{ .short = 'i', .help = "Auto-apply fixes to test files" },
+        .debug = .{ .short = 'd', .help = "Write output directly to terminal" },
+        .@"inherit-env" = .{ .short = 'E', .help = "Inherit parent environment" },
+        .@"keep-tmpdir" = .{ .help = "Don't remove temp directories" },
+        .bindir = .{ .help = "Prepend DIR to PATH (repeatable)" },
+        .env = .{ .short = 'e', .help = "Set environment variable VAR=VAL (repeatable)" },
+        .version = .{ .short = 'V', .help = "Show version" },
+    };
+
+    pub const about = .{
+        .name = "quizzig",
+        .desc = "A shell testing framework written in Zig.",
+    };
 };
 
 fn findTestFiles(allocator: Allocator, paths: []const []const u8) !std.ArrayListUnmanaged([]const u8) {
@@ -1256,24 +1289,11 @@ fn parseEnvVar(s: []const u8) ?EnvVar {
 }
 
 fn printUsage() void {
-    const usage =
-        \\Usage: quizzig [OPTIONS] [TEST_FILES...]
-        \\
-        \\A shell testing framework written in Zig.
-        \\
-        \\Options:
-        \\  -h, --help           Show this help message
-        \\  -V, --version        Show version
-        \\  -q, --quiet          Don't print diffs
-        \\  -v, --verbose        Show filenames and status
-        \\  -i, --patch          Auto-apply fixes to test files
-        \\  -d, --debug          Write output directly to terminal
-        \\  --keep-tmpdir        Don't remove temp directories
-        \\  --shell=PATH         Shell to use (default: /bin/sh)
-        \\  --indent=N           Indentation spaces (default: 4)
-        \\  -E, --inherit-env    Inherit parent environment
-        \\  -e, --env VAR=VAL    Set environment variable (repeatable)
-        \\  --bindir=DIR         Prepend DIR to PATH (repeatable)
+    var buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    opt.printUsage(CliOptions, &stdout.interface);
+    stdout.interface.flush() catch {};
+    getStdout().print(
         \\
         \\Environment variables available in tests:
         \\  TESTDIR    Absolute path to test file's directory
@@ -1284,8 +1304,7 @@ fn printUsage() void {
         \\
         \\Test files should have a .t extension.
         \\
-    ;
-    getStdout().print("{s}", .{usage}) catch {};
+    , .{}) catch {};
 }
 
 pub fn main() !void {
@@ -1293,70 +1312,43 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var opts = Options{};
-    var paths: std.ArrayListUnmanaged([]const u8) = .{};
-    defer paths.deinit(allocator);
-
-    var bindirs: std.ArrayListUnmanaged([]const u8) = .{};
-    defer bindirs.deinit(allocator);
-    var env_vars: std.ArrayListUnmanaged(EnvVar) = .{};
-    defer env_vars.deinit(allocator);
-
     // Capture rootdir (cwd where quizzig was invoked)
     const rootdir = try fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(rootdir);
 
-    var args = try process.argsWithAllocator(allocator);
-    defer args.deinit();
-
-    _ = args.skip();
-
-    while (args.next()) |arg| {
-        if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
-            printUsage();
-            return;
-        } else if (mem.eql(u8, arg, "-V") or mem.eql(u8, arg, "--version")) {
-            getStdout().print("quizzig {s}\n", .{version}) catch {};
-            return;
-        } else if (mem.eql(u8, arg, "-q") or mem.eql(u8, arg, "--quiet")) {
-            opts.quiet = true;
-        } else if (mem.eql(u8, arg, "-v") or mem.eql(u8, arg, "--verbose")) {
-            opts.verbose = true;
-        } else if (mem.eql(u8, arg, "-i") or mem.eql(u8, arg, "--patch")) {
-            opts.patch = true;
-        } else if (mem.eql(u8, arg, "-d") or mem.eql(u8, arg, "--debug")) {
-            opts.debug = true;
-        } else if (mem.eql(u8, arg, "--keep-tmpdir")) {
-            opts.keep_tmpdir = true;
-        } else if (mem.eql(u8, arg, "-E") or mem.eql(u8, arg, "--inherit-env")) {
-            opts.inherit_env = true;
-        } else if (mem.startsWith(u8, arg, "--shell=")) {
-            opts.shell = arg[8..];
-        } else if (mem.startsWith(u8, arg, "--indent=")) {
-            opts.indent = try std.fmt.parseInt(usize, arg[9..], 10);
-        } else if (mem.startsWith(u8, arg, "--bindir=")) {
-            try bindirs.append(allocator, arg[9..]);
-        } else if (mem.eql(u8, arg, "--bindir")) {
-            if (args.next()) |dir| {
-                try bindirs.append(allocator, dir);
-            }
-        } else if (mem.startsWith(u8, arg, "--env=")) {
-            if (parseEnvVar(arg[6..])) |ev| {
-                try env_vars.append(allocator, ev);
-            }
-        } else if (mem.eql(u8, arg, "--env") or mem.eql(u8, arg, "-e")) {
-            if (args.next()) |val| {
-                if (parseEnvVar(val)) |ev| {
-                    try env_vars.append(allocator, ev);
-                }
-            }
-        } else if (arg[0] != '-') {
-            try paths.append(allocator, arg);
-        }
+    // Collect args into slice for opt.parse (skip argv[0])
+    var args_list: std.ArrayListUnmanaged([]const u8) = .{};
+    defer args_list.deinit(allocator);
+    var args_iter = process.args();
+    _ = args_iter.skip(); // skip program name
+    while (args_iter.next()) |arg| {
+        try args_list.append(allocator, arg);
     }
 
-    opts.env_vars = env_vars.items;
-    opts.rootdir = rootdir;
+    // Parse CLI options
+    var cli_opts = CliOptions{};
+    const paths = opt.parse(CliOptions, &cli_opts, args_list.items) catch |err| {
+        if (err == error.Help) {
+            printUsage();
+            return;
+        }
+        getStderr().print("Error: {}\n", .{err}) catch {};
+        return;
+    };
+
+    if (cli_opts.version) {
+        getStdout().print("quizzig {s}\n", .{version}) catch {};
+        return;
+    }
+
+    // Convert env strings to EnvVar structs
+    var env_vars: std.ArrayListUnmanaged(EnvVar) = .{};
+    defer env_vars.deinit(allocator);
+    for (cli_opts.env.constSlice()) |ev_str| {
+        if (parseEnvVar(ev_str)) |ev| {
+            try env_vars.append(allocator, ev);
+        }
+    }
 
     // Resolve bindirs to absolute paths
     var abs_bindirs: std.ArrayListUnmanaged([]const u8) = .{};
@@ -1364,19 +1356,32 @@ pub fn main() !void {
         for (abs_bindirs.items) |p| allocator.free(p);
         abs_bindirs.deinit(allocator);
     }
-
-    for (bindirs.items) |dir| {
+    for (cli_opts.bindir.constSlice()) |dir| {
         const abs_dir = try fs.cwd().realpathAlloc(allocator, dir);
         try abs_bindirs.append(allocator, abs_dir);
     }
-    opts.bindirs = abs_bindirs.items;
 
-    if (paths.items.len == 0) {
+    // Build internal Options struct
+    var opts = Options{
+        .shell = cli_opts.shell,
+        .indent = cli_opts.indent,
+        .quiet = cli_opts.quiet,
+        .verbose = cli_opts.verbose,
+        .patch = cli_opts.patch,
+        .debug = cli_opts.debug,
+        .inherit_env = cli_opts.@"inherit-env",
+        .keep_tmpdir = cli_opts.@"keep-tmpdir",
+        .bindirs = abs_bindirs.items,
+        .env_vars = env_vars.items,
+        .rootdir = rootdir,
+    };
+
+    if (paths.len == 0) {
         printUsage();
         return;
     }
 
-    var test_files = try findTestFiles(allocator, paths.items);
+    var test_files = try findTestFiles(allocator, paths);
     defer {
         for (test_files.items) |f| {
             allocator.free(f);

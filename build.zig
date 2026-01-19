@@ -6,7 +6,6 @@ pub fn build(b: *std.Build) void {
     const version = b.option([]const u8, "version", "Version string") orelse "dev";
     const output = b.option([]const u8, "output", "Custom output path (e.g., dist/quizzig-Linux-x86_64)");
 
-    // Get PCRE2 dependency (builds itself)
     const pcre2_dep = b.dependency("pcre2", .{
         .target = target,
         .optimize = optimize,
@@ -30,6 +29,9 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
     exe.linkLibrary(pcre2_lib);
+
+    const opt = b.dependency("opt", .{});
+    exe.root_module.addImport("opt", opt.module("opt"));
 
     if (output) |out_path| {
         const install = b.addInstallFileWithDir(exe.getEmittedBin(), .prefix, out_path);

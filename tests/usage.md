@@ -5,7 +5,7 @@ Set up quizzig alias:
 Help shows usage line:
 
     $ quizzig -h | head -1
-    Usage: quizzig [OPTIONS] [TEST_FILES...]
+    quizzig - A shell testing framework written in Zig.
 
 Help mentions key flags:
 
@@ -26,7 +26,7 @@ Version output:
 No arguments shows usage:
 
     $ quizzig | head -1
-    Usage: quizzig [OPTIONS] [TEST_FILES...]
+    quizzig - A shell testing framework written in Zig.
 
 No tests found in empty directory:
 
