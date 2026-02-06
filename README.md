@@ -14,7 +14,7 @@ distributed as a single small binary.
 
 ```bash
 curl -fsSL https://github.com/piranha/quizzig/releases/latest/download/quizzig-$(uname -s)-$(uname -m) \
-  -o ~/.local/bin/quizzig && chmod +x ~/.local/bin/quizzig
+  -o ~/bin/quizzig && chmod +x ~/bin/quizzig
 ```
 
 Or grab a binary from [releases](https://github.com/piranha/quizzig/releases).
