@@ -1302,8 +1302,6 @@ fn printUsage() void {
         \\  CRAMTMP    Temp directory root
         \\  QUIZZIG    Always "1"
         \\
-        \\Test files should have a .t extension.
-        \\
     , .{}) catch {};
 }
 
