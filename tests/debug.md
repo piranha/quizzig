@@ -58,6 +58,20 @@ Verbose trace streams command output before the command exits:
     $ touch stream-release
     $ wait $pid
 
+Verbose mode streams per-test status before the file finishes:
+
+    $ cat > verbose-stream.md <<'EOF'
+    >     $ true
+    >     $ touch "$TESTDIR/verbose-status-ready"
+    >     > while [ ! -f "$TESTDIR/verbose-status-release" ]; do sleep 0.05; done
+    > EOF
+    $ quizzig -v verbose-stream.md >status.out 2>&1 & pid=$!
+    $ i=0; while [ ! -f verbose-status-ready ] && [ $i -lt 100 ]; do i=$((i + 1)); sleep 0.05; done
+    $ grep -q '^verbose-stream.md: \.' status.out && echo status-before-wait
+    status-before-wait
+    $ touch verbose-status-release
+    $ wait $pid
+
 Verbose mode with empty test:
 
     $ quizzig -v examples/empty.md

@@ -280,7 +280,12 @@ pub const Executor = struct {
         try self.env.put("ROOTDIR", rootdir);
     }
 
-    pub fn execute(self: *Executor, commands: []const TestCommand, trace: ?*TraceStreamer) !std.ArrayListUnmanaged(CommandResult) {
+    pub fn execute(
+        self: *Executor,
+        commands: []const TestCommand,
+        trace: ?*TraceStreamer,
+        status_streamer: ?*StatusStreamer,
+    ) !std.ArrayListUnmanaged(CommandResult) {
         var results: std.ArrayListUnmanaged(CommandResult) = .{};
         errdefer {
             for (results.items) |r| {
@@ -359,6 +364,7 @@ pub const Executor = struct {
                         &results,
                         &current_output,
                         trace,
+                        status_streamer,
                     );
                     line_buf.clearRetainingCapacity();
                     start_idx = i + 1;
@@ -376,6 +382,7 @@ pub const Executor = struct {
                 &results,
                 &current_output,
                 trace,
+                status_streamer,
             );
         }
 
@@ -485,6 +492,15 @@ const TraceStreamer = struct {
     }
 };
 
+const StatusStreamer = struct {
+    printed: usize = 0,
+
+    fn endCommand(self: *StatusStreamer, status: u8) !void {
+        try getStderr().print("{c}", .{status});
+        self.printed += 1;
+    }
+};
+
 fn commandTraceStatus(allocator: Allocator, cmd: *const TestCommand, result: CommandResult) !u8 {
     if (result.exit_code == 80) return 's';
 
@@ -502,6 +518,7 @@ fn processExecutorOutputLine(
     results: *std.ArrayListUnmanaged(CommandResult),
     current_output: *std.ArrayListUnmanaged(u8),
     trace: ?*TraceStreamer,
+    status_streamer: ?*StatusStreamer,
 ) !void {
     if (mem.startsWith(u8, line, salt_pattern)) {
         // Parse command index and exit code from this marker.
@@ -527,12 +544,20 @@ fn processExecutorOutputLine(
             .exit_code = exit_code,
         };
 
-        if (trace) |t| {
+        if (trace != null or status_streamer != null) {
             const status = if (idx < commands.len)
                 try commandTraceStatus(allocator, &commands[idx], results.items[idx])
             else
                 '!';
-            try t.endCommand(idx, status);
+
+            if (trace) |t| {
+                try t.endCommand(idx, status);
+            }
+            if (status_streamer) |s| {
+                if (idx < commands.len) {
+                    try s.endCommand(status);
+                }
+            }
         }
 
         current_output.clearRetainingCapacity();
@@ -1170,8 +1195,12 @@ pub fn runTestFile(
         try skipped_tests.append(allocator, .{ .file = path, .line = 0, .command = try allocator.dupe(u8, "(no commands)") });
         const status = try allocator.dupe(u8, "s");
         errdefer allocator.free(status);
+        const status_streamed = opts.verbose and !opts.trace;
+        if (status_streamed) {
+            try getStderr().print("s", .{});
+        }
         const trace_output = if (opts.trace) try generateNoCommandTrace(allocator, path, parser.lines.items) else "";
-        return .{ .passed = 0, .failed = 0, .skipped = 1, .skipped_tests = skipped_tests, .diff_output = "", .patched_content = null, .status = status, .trace_output = trace_output };
+        return .{ .passed = 0, .failed = 0, .skipped = 1, .skipped_tests = skipped_tests, .diff_output = "", .patched_content = null, .status = status, .status_streamed = status_streamed, .trace_output = trace_output };
     }
 
     const basename = fs.path.basename(path);
@@ -1205,7 +1234,13 @@ pub fn runTestFile(
     try executor.setTestEnv(abs_dirname, basename, opts.rootdir);
 
     var trace_streamer = TraceStreamer.init(allocator, path, parser.lines.items, commands.items, opts.indent, opts.color);
-    var results = try executor.execute(commands.items, if (opts.trace) &trace_streamer else null);
+    const stream_status = opts.verbose and !opts.trace and !opts.patch;
+    var status_streamer = StatusStreamer{};
+    var results = try executor.execute(
+        commands.items,
+        if (opts.trace) &trace_streamer else null,
+        if (stream_status) &status_streamer else null,
+    );
     defer {
         for (results.items) |r| {
             allocator.free(r.output);
@@ -1261,6 +1296,9 @@ pub fn runTestFile(
         if (i >= results.items.len) {
             failed += 1;
             try status.append(allocator, '!');
+            if (stream_status and i >= status_streamer.printed) {
+                try status_streamer.endCommand('!');
+            }
             continue;
         }
 
@@ -1269,6 +1307,9 @@ pub fn runTestFile(
         if (result.exit_code == 80) {
             skipped += 1;
             try status.append(allocator, 's');
+            if (stream_status and i >= status_streamer.printed) {
+                try status_streamer.endCommand('s');
+            }
             const first_line = if (cmd.lines.items.len > 0) cmd.lines.items[0] else "";
             const cmd_dupe = try allocator.dupe(u8, first_line);
             try skipped_tests.append(allocator, .{ .file = path, .line = cmd.line_num, .command = cmd_dupe });
@@ -1284,6 +1325,9 @@ pub fn runTestFile(
         if (has_diff) {
             failed += 1;
             try status.append(allocator, '!');
+            if (stream_status and i >= status_streamer.printed) {
+                try status_streamer.endCommand('!');
+            }
 
             // For --patch mode: record the correction
             if (opts.patch) {
@@ -1360,6 +1404,9 @@ pub fn runTestFile(
         } else {
             passed += 1;
             try status.append(allocator, '.');
+            if (stream_status and i >= status_streamer.printed) {
+                try status_streamer.endCommand('.');
+            }
         }
     }
 
@@ -1518,6 +1565,7 @@ pub fn runTestFile(
                 .diff_output = diff_slice,
                 .patched_content = patched,
                 .status = status_output,
+                .status_streamed = stream_status,
                 .trace_output = trace_output,
             };
         }
@@ -1534,6 +1582,7 @@ pub fn runTestFile(
         .diff_output = "",
         .patched_content = null,
         .status = status_output,
+        .status_streamed = stream_status,
         .trace_output = trace_output,
     };
 }
@@ -1552,6 +1601,7 @@ pub const TestFileResult = struct {
     diff_output: []const u8, // owned, caller must free
     patched_content: ?[]const u8, // if patch mode, the corrected file content
     status: []const u8, // per-command status chars (owned, caller must free)
+    status_streamed: bool, // status chars were already written during verbose execution
     trace_output: []const u8, // owned when non-empty
 };
 
@@ -1875,12 +1925,14 @@ pub fn main() !void {
                 try stderr.print("{s}", .{result.trace_output});
             }
         } else if (opts.verbose) {
-            if (result.patched_content != null) {
-                for (result.status) |ch| {
-                    try stderr.print("{c}", .{if (ch == '!') 'P' else ch});
+            if (!result.status_streamed) {
+                if (result.patched_content != null) {
+                    for (result.status) |ch| {
+                        try stderr.print("{c}", .{if (ch == '!') 'P' else ch});
+                    }
+                } else {
+                    try stderr.print("{s}", .{result.status});
                 }
-            } else {
-                try stderr.print("{s}", .{result.status});
             }
             try stderr.print("\n", .{});
         } else if (result.patched_content != null) {
