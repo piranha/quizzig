@@ -32,7 +32,8 @@ quizzig [OPTIONS] [TEST_FILES...]
 - `-h, --help` - Show help
 - `-V, --version` - Show version
 - `-q, --quiet` - Don't print diffs
-- `-v, --verbose` - Show filenames and per-test status
+- `-v, --verbose` - Show filenames and per-test status; repeat as `-vv` for a markdown trace with actual output
+- `-d, --debug` - Alias for `-vv`
 - `--shell=PATH` - Shell to use (default: `/bin/sh`)
 - `--indent=N` - Indentation spaces (default: 2)
 - `-E, --inherit-env` - Inherit parent environment as base

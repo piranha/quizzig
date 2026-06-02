@@ -280,7 +280,7 @@ pub const Executor = struct {
         try self.env.put("ROOTDIR", rootdir);
     }
 
-    pub fn execute(self: *Executor, commands: []const TestCommand, debug: bool) !std.ArrayListUnmanaged(CommandResult) {
+    pub fn execute(self: *Executor, commands: []const TestCommand) !std.ArrayListUnmanaged(CommandResult) {
         var results: std.ArrayListUnmanaged(CommandResult) = .{};
 
         // Generate unique salt to avoid collisions with nested quizzig runs
@@ -298,9 +298,7 @@ pub const Executor = struct {
                 try script.append(self.allocator, '\n');
             }
             // Write salt marker - capture exit code first, then output marker
-            if (!debug) {
-                try script.writer(self.allocator).print("__qz_ec=$?; env printf '\\n{s} {d} '\"$__qz_ec\"'\\n'\n", .{ salt, i });
-            }
+            try script.writer(self.allocator).print("__qz_ec=$?; env printf '\\n{s} {d} '\"$__qz_ec\"'\\n'\n", .{ salt, i });
         }
 
         // Execute script via shell, merging stderr into stdout
@@ -309,8 +307,7 @@ pub const Executor = struct {
             self.allocator,
         );
         child.stdin_behavior = .Pipe;
-        // In debug mode, let output go directly to terminal
-        child.stdout_behavior = if (debug) .Inherit else .Pipe;
+        child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Inherit;
         child.env_map = &self.env;
         child.cwd = self.tmpdir;
@@ -322,16 +319,6 @@ pub const Executor = struct {
             try stdin.writeAll(script.items);
             stdin.close();
             child.stdin = null;
-        }
-
-        if (debug) {
-            // In debug mode, we don't capture output - just wait for completion
-            // All commands are considered "passed" since we can't compare
-            _ = try child.wait();
-            for (0..commands.len) |_| {
-                try results.append(self.allocator, .{ .output = "", .exit_code = 0 });
-            }
-            return results;
         }
 
         // Read combined output
@@ -796,6 +783,138 @@ fn needsEscaping(s: []const u8) bool {
     return false;
 }
 
+fn appendTraceIndent(out: *std.ArrayListUnmanaged(u8), allocator: Allocator, indent: usize) !void {
+    for (0..indent) |_| {
+        try out.append(allocator, ' ');
+    }
+}
+
+fn appendTraceSourceLine(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: Allocator,
+    source_lines: []const []const u8,
+    line_num: usize,
+) !void {
+    if (line_num == 0) return;
+    const idx = line_num - 1;
+    if (idx >= source_lines.len) return;
+
+    // mem.splitScalar leaves a final empty item for files ending in '\n'.
+    // Do not render that phantom EOF line in trace output.
+    if (idx == source_lines.len - 1 and source_lines[idx].len == 0) return;
+
+    try out.appendSlice(allocator, source_lines[idx]);
+    try out.append(allocator, '\n');
+}
+
+fn appendTraceActualLine(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: Allocator,
+    indent: usize,
+    line: []const u8,
+) !void {
+    try appendTraceIndent(out, allocator, indent);
+    if (needsEscaping(line)) {
+        const escaped = try escapeOutput(allocator, line);
+        defer allocator.free(escaped);
+        try out.writer(allocator).print("{s} (esc)\n", .{escaped});
+    } else {
+        try out.writer(allocator).print("{s}\n", .{line});
+    }
+}
+
+fn appendTraceActualOutput(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: Allocator,
+    indent: usize,
+    actual: []const u8,
+    exit_code: u8,
+) !void {
+    if (actual.len > 0) {
+        var iter = mem.splitScalar(u8, actual, '\n');
+        while (iter.next()) |line| {
+            if (iter.peek() == null and line.len == 0) break;
+            try appendTraceActualLine(out, allocator, indent, line);
+        }
+    }
+
+    if (exit_code != 0) {
+        try appendTraceIndent(out, allocator, indent);
+        try out.writer(allocator).print("[{d}]\n", .{exit_code});
+    }
+}
+
+fn traceStatusName(status: u8) []const u8 {
+    return switch (status) {
+        '.' => "PASS",
+        '!' => "FAIL",
+        's' => "SKIP",
+        else => "ERROR",
+    };
+}
+
+fn generateNoCommandTrace(
+    allocator: Allocator,
+    path: []const u8,
+    source_lines: []const []const u8,
+) ![]const u8 {
+    var trace: std.ArrayListUnmanaged(u8) = .{};
+    errdefer trace.deinit(allocator);
+
+    try trace.writer(allocator).print("# quizzig trace: {s}\n", .{path});
+    for (source_lines, 1..) |_, line_num| {
+        try appendTraceSourceLine(&trace, allocator, source_lines, line_num);
+    }
+    try trace.appendSlice(allocator, "# quizzig: SKIP no commands\n");
+
+    return trace.toOwnedSlice(allocator);
+}
+
+fn generateTraceMarkdown(
+    allocator: Allocator,
+    path: []const u8,
+    source_lines: []const []const u8,
+    commands: []const TestCommand,
+    results: []const CommandResult,
+    status: []const u8,
+    indent: usize,
+) ![]const u8 {
+    var trace: std.ArrayListUnmanaged(u8) = .{};
+    errdefer trace.deinit(allocator);
+
+    try trace.writer(allocator).print("# quizzig trace: {s}\n", .{path});
+
+    var src_line: usize = 1;
+    for (commands, 0..) |cmd, i| {
+        while (src_line < cmd.line_num) : (src_line += 1) {
+            try appendTraceSourceLine(&trace, allocator, source_lines, src_line);
+        }
+
+        const command_end = cmd.line_num + cmd.lines.items.len;
+        while (src_line < command_end) : (src_line += 1) {
+            try appendTraceSourceLine(&trace, allocator, source_lines, src_line);
+        }
+
+        if (i < results.len) {
+            const result = results[i];
+            try appendTraceActualOutput(&trace, allocator, indent, result.output, result.exit_code);
+        }
+
+        const ch = if (i < status.len) status[i] else '!';
+        try trace.writer(allocator).print("# quizzig: {s} line {d}\n", .{ traceStatusName(ch), cmd.line_num });
+
+        // The trace is a markdown transcript with actual output, so replace the
+        // expected-output block from the source file with the captured output.
+        src_line = command_end + cmd.expected.items.len;
+    }
+
+    while (src_line <= source_lines.len) : (src_line += 1) {
+        try appendTraceSourceLine(&trace, allocator, source_lines, src_line);
+    }
+
+    return trace.toOwnedSlice(allocator);
+}
+
 // Test file runner
 pub fn runTestFile(
     allocator: Allocator,
@@ -819,7 +938,10 @@ pub fn runTestFile(
     if (commands.items.len == 0) {
         var skipped_tests: std.ArrayListUnmanaged(SkippedTest) = .{};
         try skipped_tests.append(allocator, .{ .file = path, .line = 0, .command = try allocator.dupe(u8, "(no commands)") });
-        return .{ .passed = 0, .failed = 0, .skipped = 1, .skipped_tests = skipped_tests, .diff_output = "", .patched_content = null, .status = try allocator.dupe(u8, "s") };
+        const status = try allocator.dupe(u8, "s");
+        errdefer allocator.free(status);
+        const trace_output = if (opts.trace) try generateNoCommandTrace(allocator, path, parser.lines.items) else "";
+        return .{ .passed = 0, .failed = 0, .skipped = 1, .skipped_tests = skipped_tests, .diff_output = "", .patched_content = null, .status = status, .trace_output = trace_output };
     }
 
     const basename = fs.path.basename(path);
@@ -852,7 +974,7 @@ pub fn runTestFile(
 
     try executor.setTestEnv(abs_dirname, basename, opts.rootdir);
 
-    var results = try executor.execute(commands.items, opts.debug);
+    var results = try executor.execute(commands.items);
     defer {
         for (results.items) |r| {
             allocator.free(r.output);
@@ -1150,18 +1272,30 @@ pub fn runTestFile(
                 }
                 break :blk try patched_content.toOwnedSlice(allocator);
             } else null;
+            errdefer if (patched) |p| allocator.free(p);
+
+            const diff_slice = try diff_output.toOwnedSlice(allocator);
+            errdefer allocator.free(diff_slice);
+            const trace_output = if (opts.trace) try generateTraceMarkdown(allocator, path, parser.lines.items, commands.items, results.items, status.items, opts.indent) else "";
+            errdefer if (trace_output.len > 0) allocator.free(trace_output);
+            const status_output = try status.toOwnedSlice(allocator);
 
             return .{
                 .passed = passed,
                 .failed = failed,
                 .skipped = skipped,
                 .skipped_tests = skipped_tests,
-                .diff_output = try diff_output.toOwnedSlice(allocator),
+                .diff_output = diff_slice,
                 .patched_content = patched,
-                .status = try status.toOwnedSlice(allocator),
+                .status = status_output,
+                .trace_output = trace_output,
             };
         }
     }
+
+    const trace_output = if (opts.trace) try generateTraceMarkdown(allocator, path, parser.lines.items, commands.items, results.items, status.items, opts.indent) else "";
+    errdefer if (trace_output.len > 0) allocator.free(trace_output);
+    const status_output = try status.toOwnedSlice(allocator);
 
     return .{
         .passed = passed,
@@ -1170,7 +1304,8 @@ pub fn runTestFile(
         .skipped_tests = skipped_tests,
         .diff_output = "",
         .patched_content = null,
-        .status = try status.toOwnedSlice(allocator),
+        .status = status_output,
+        .trace_output = trace_output,
     };
 }
 
@@ -1188,6 +1323,7 @@ pub const TestFileResult = struct {
     diff_output: []const u8, // owned, caller must free
     patched_content: ?[]const u8, // if patch mode, the corrected file content
     status: []const u8, // per-command status chars (owned, caller must free)
+    trace_output: []const u8, // owned when non-empty
 };
 
 pub const EnvVar = struct {
@@ -1200,8 +1336,8 @@ pub const Options = struct {
     indent: usize = 4,
     quiet: bool = false,
     verbose: bool = false,
+    trace: bool = false,
     patch: bool = false,
-    debug: bool = false,
     inherit_env: bool = false,
     keep_tmpdir: bool = false,
     xunit_file: ?[]const u8 = null,
@@ -1227,9 +1363,9 @@ const CliOptions = struct {
         .shell = .{ .help = "Shell to use" },
         .indent = .{ .help = "Indentation spaces" },
         .quiet = .{ .short = 'q', .help = "Don't print diffs" },
-        .verbose = .{ .short = 'v', .help = "Show filenames and per-test status" },
+        .verbose = .{ .short = 'v', .help = "Show filenames and per-test status; repeat for markdown trace" },
         .patch = .{ .short = 'i', .help = "Auto-apply fixes to test files" },
-        .debug = .{ .short = 'd', .help = "Write output directly to terminal" },
+        .debug = .{ .short = 'd', .help = "Alias for -vv markdown trace" },
         .@"inherit-env" = .{ .short = 'E', .help = "Inherit parent environment" },
         .@"keep-tmpdir" = .{ .help = "Don't remove temp directories" },
         .bindir = .{ .help = "Prepend DIR to PATH (repeatable)" },
@@ -1297,6 +1433,43 @@ fn parseEnvVar(s: []const u8) ?EnvVar {
     };
 }
 
+fn countVerboseArgs(args: []const []const u8) usize {
+    var count: usize = 0;
+    var stop_parsing_options = false;
+
+    for (args) |arg| {
+        if (arg.len == 0) continue;
+
+        if (stop_parsing_options) continue;
+        if (mem.eql(u8, arg, "--")) {
+            stop_parsing_options = true;
+            continue;
+        }
+
+        if (mem.eql(u8, arg, "--verbose")) {
+            count += 1;
+            continue;
+        }
+
+        if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
+            var i: usize = 1;
+            while (i < arg.len) : (i += 1) {
+                const short = arg[i];
+                if (short == 'v') {
+                    count += 1;
+                    continue;
+                }
+
+                // -e consumes the rest of the short option as its value, so a
+                // "v" after it is env text, not another verbose flag.
+                if (short == 'e') break;
+            }
+        }
+    }
+
+    return count;
+}
+
 fn printUsage() void {
     var buf: [4096]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&buf);
@@ -1326,11 +1499,13 @@ pub fn main() !void {
     // Collect args into slice for opt.parse (skip argv[0])
     var args_list: std.ArrayListUnmanaged([]const u8) = .{};
     defer args_list.deinit(allocator);
-    var args_iter = process.args();
+    var args_iter = try process.argsWithAllocator(allocator);
+    defer args_iter.deinit();
     _ = args_iter.skip(); // skip program name
     while (args_iter.next()) |arg| {
         try args_list.append(allocator, arg);
     }
+    const verbose_count = countVerboseArgs(args_list.items);
 
     // Parse CLI options
     var cli_opts = CliOptions{};
@@ -1374,8 +1549,8 @@ pub fn main() !void {
         .indent = cli_opts.indent,
         .quiet = cli_opts.quiet,
         .verbose = cli_opts.verbose,
+        .trace = cli_opts.debug or verbose_count >= 2,
         .patch = cli_opts.patch,
-        .debug = cli_opts.debug,
         .inherit_env = cli_opts.@"inherit-env",
         .keep_tmpdir = cli_opts.@"keep-tmpdir",
         .bindirs = abs_bindirs.items,
@@ -1414,14 +1589,18 @@ pub fn main() !void {
     defer all_diffs.deinit(allocator);
 
     for (test_files.items) |test_path| {
-        if (opts.verbose) {
+        if (opts.verbose and !opts.trace) {
             try stderr.print("{s}: ", .{test_path});
         }
 
         var result = runTestFile(allocator, test_path, &opts) catch |err| {
-            try stderr.print("E", .{});
-            if (opts.verbose) {
-                try stderr.print(" error: {}\n", .{err});
+            if (opts.trace) {
+                try stderr.print("# quizzig trace: {s}\n# quizzig: ERROR {}\n", .{ test_path, err });
+            } else {
+                try stderr.print("E", .{});
+                if (opts.verbose) {
+                    try stderr.print(" error: {}\n", .{err});
+                }
             }
             total_failed += 1;
             continue;
@@ -1430,6 +1609,7 @@ pub fn main() !void {
         defer if (result.diff_output.len > 0) allocator.free(result.diff_output);
         defer if (result.patched_content) |p| allocator.free(p);
         defer if (result.status.len > 0) allocator.free(result.status);
+        defer if (result.trace_output.len > 0) allocator.free(result.trace_output);
 
         total_passed += result.passed;
         total_failed += result.failed;
@@ -1451,7 +1631,11 @@ pub fn main() !void {
             try all_diffs.appendSlice(allocator, result.diff_output);
         }
 
-        if (opts.verbose) {
+        if (opts.trace) {
+            if (result.trace_output.len > 0) {
+                try stderr.print("{s}", .{result.trace_output});
+            }
+        } else if (opts.verbose) {
             if (result.patched_content != null) {
                 for (result.status) |ch| {
                     try stderr.print("{c}", .{if (ch == '!') 'P' else ch});
@@ -1484,7 +1668,7 @@ pub fn main() !void {
         total_failed,
     });
 
-    if (all_skipped.items.len > 0 and opts.verbose) {
+    if (all_skipped.items.len > 0 and (opts.verbose or opts.trace)) {
         try stderr.print("# Skipped:\n", .{});
         for (all_skipped.items) |s| {
             if (s.line == 0) {
