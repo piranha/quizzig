@@ -19,16 +19,16 @@ Run examples with bash:
 Verbose mode:
 
     $ quizzig -E -q -v examples examples/fail.md
-    examples/advanced.md: .
+    examples/advanced.md: ....................
     examples/bare.md: .
-    examples/basic.md: .
+    examples/basic.md: .........
     examples/empty.md: s
-    examples/env.md: .
-    examples/fail.md: !
-    examples/fail.md: !
+    examples/env.md: ..........
+    examples/fail.md: !!!!!
+    examples/fail.md: !!!!!
     examples/missingeol.md: .
-    examples/skip.md: .
-    examples/test.md: .
+    examples/skip.md: s.s.
+    examples/test.md: ..
     
     # Ran 55 tests, 3 skipped, 10 failed.
     # Skipped:

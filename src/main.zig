@@ -819,7 +819,7 @@ pub fn runTestFile(
     if (commands.items.len == 0) {
         var skipped_tests: std.ArrayListUnmanaged(SkippedTest) = .{};
         try skipped_tests.append(allocator, .{ .file = path, .line = 0, .command = try allocator.dupe(u8, "(no commands)") });
-        return .{ .passed = 0, .failed = 0, .skipped = 1, .skipped_tests = skipped_tests, .diff_output = "", .patched_content = null };
+        return .{ .passed = 0, .failed = 0, .skipped = 1, .skipped_tests = skipped_tests, .diff_output = "", .patched_content = null, .status = try allocator.dupe(u8, "s") };
     }
 
     const basename = fs.path.basename(path);
@@ -864,6 +864,8 @@ pub fn runTestFile(
     var failed: usize = 0;
     var skipped: usize = 0;
     var skipped_tests: std.ArrayListUnmanaged(SkippedTest) = .{};
+    var status: std.ArrayListUnmanaged(u8) = .{};
+    errdefer status.deinit(allocator);
 
     // For --patch mode: track line replacements (start_line, end_line exclusive, new_lines)
     const Correction = struct {
@@ -905,6 +907,7 @@ pub fn runTestFile(
     for (commands.items, 0..) |cmd, i| {
         if (i >= results.items.len) {
             failed += 1;
+            try status.append(allocator, '!');
             continue;
         }
 
@@ -912,6 +915,7 @@ pub fn runTestFile(
 
         if (result.exit_code == 80) {
             skipped += 1;
+            try status.append(allocator, 's');
             const first_line = if (cmd.lines.items.len > 0) cmd.lines.items[0] else "";
             const cmd_dupe = try allocator.dupe(u8, first_line);
             try skipped_tests.append(allocator, .{ .file = path, .line = cmd.line_num, .command = cmd_dupe });
@@ -926,6 +930,7 @@ pub fn runTestFile(
 
         if (has_diff) {
             failed += 1;
+            try status.append(allocator, '!');
 
             // For --patch mode: record the correction
             if (opts.patch) {
@@ -1001,6 +1006,7 @@ pub fn runTestFile(
             }
         } else {
             passed += 1;
+            try status.append(allocator, '.');
         }
     }
 
@@ -1152,6 +1158,7 @@ pub fn runTestFile(
                 .skipped_tests = skipped_tests,
                 .diff_output = try diff_output.toOwnedSlice(allocator),
                 .patched_content = patched,
+                .status = try status.toOwnedSlice(allocator),
             };
         }
     }
@@ -1163,6 +1170,7 @@ pub fn runTestFile(
         .skipped_tests = skipped_tests,
         .diff_output = "",
         .patched_content = null,
+        .status = try status.toOwnedSlice(allocator),
     };
 }
 
@@ -1179,6 +1187,7 @@ pub const TestFileResult = struct {
     skipped_tests: std.ArrayListUnmanaged(SkippedTest),
     diff_output: []const u8, // owned, caller must free
     patched_content: ?[]const u8, // if patch mode, the corrected file content
+    status: []const u8, // per-command status chars (owned, caller must free)
 };
 
 pub const EnvVar = struct {
@@ -1218,7 +1227,7 @@ const CliOptions = struct {
         .shell = .{ .help = "Shell to use" },
         .indent = .{ .help = "Indentation spaces" },
         .quiet = .{ .short = 'q', .help = "Don't print diffs" },
-        .verbose = .{ .short = 'v', .help = "Show filenames and status" },
+        .verbose = .{ .short = 'v', .help = "Show filenames and per-test status" },
         .patch = .{ .short = 'i', .help = "Auto-apply fixes to test files" },
         .debug = .{ .short = 'd', .help = "Write output directly to terminal" },
         .@"inherit-env" = .{ .short = 'E', .help = "Inherit parent environment" },
@@ -1420,6 +1429,7 @@ pub fn main() !void {
         defer result.skipped_tests.deinit(allocator);
         defer if (result.diff_output.len > 0) allocator.free(result.diff_output);
         defer if (result.patched_content) |p| allocator.free(p);
+        defer if (result.status.len > 0) allocator.free(result.status);
 
         total_passed += result.passed;
         total_failed += result.failed;
@@ -1441,7 +1451,16 @@ pub fn main() !void {
             try all_diffs.appendSlice(allocator, result.diff_output);
         }
 
-        if (result.patched_content != null) {
+        if (opts.verbose) {
+            if (result.patched_content != null) {
+                for (result.status) |ch| {
+                    try stderr.print("{c}", .{if (ch == '!') 'P' else ch});
+                }
+            } else {
+                try stderr.print("{s}", .{result.status});
+            }
+            try stderr.print("\n", .{});
+        } else if (result.patched_content != null) {
             try stderr.print("P", .{}); // Patched
         } else if (result.failed > 0) {
             try stderr.print("!", .{});
@@ -1449,10 +1468,6 @@ pub fn main() !void {
             try stderr.print("s", .{});
         } else {
             try stderr.print(".", .{});
-        }
-
-        if (opts.verbose) {
-            try stderr.print("\n", .{});
         }
     }
 
