@@ -395,6 +395,7 @@ const TraceStreamer = struct {
     source_lines: []const []const u8,
     commands: []const TestCommand,
     indent: usize,
+    color: bool,
     src_line: usize = 1,
     next_command: usize = 0,
     pending_blank_lines: usize = 0,
@@ -405,6 +406,7 @@ const TraceStreamer = struct {
         source_lines: []const []const u8,
         commands: []const TestCommand,
         indent: usize,
+        color: ColorMode,
     ) TraceStreamer {
         return .{
             .allocator = allocator,
@@ -412,6 +414,7 @@ const TraceStreamer = struct {
             .source_lines = source_lines,
             .commands = commands,
             .indent = indent,
+            .color = useColorForMode(color),
         };
     }
 
@@ -457,7 +460,7 @@ const TraceStreamer = struct {
 
         if (idx < self.commands.len) {
             const cmd = self.commands[idx];
-            try getStderr().print("# quizzig: {s} line {d}\n", .{ traceStatusName(status), cmd.line_num });
+            try writeTraceStatusLine(self.color, status, cmd.line_num);
             self.src_line = cmd.line_num + cmd.lines.items.len + cmd.expected.items.len;
         }
 
@@ -569,6 +572,15 @@ fn writeTraceActualLine(allocator: Allocator, indent: usize, line: []const u8) !
         try getStderr().print("{s} (esc)\n", .{escaped});
     } else {
         try getStderr().print("{s}\n", .{line});
+    }
+}
+
+fn writeTraceStatusLine(color: bool, status: u8, line_num: usize) !void {
+    const stderr = getStderr();
+    if (color) {
+        try stderr.print("# quizzig: {s}{s}\x1b[0m line {d}\n", .{ traceStatusAnsi(status), traceStatusName(status), line_num });
+    } else {
+        try stderr.print("# quizzig: {s} line {d}\n", .{ traceStatusName(status), line_num });
     }
 }
 
@@ -1052,6 +1064,25 @@ fn traceStatusName(status: u8) []const u8 {
     };
 }
 
+fn traceStatusAnsi(status: u8) []const u8 {
+    return switch (status) {
+        '.' => "\x1b[32m",
+        's' => "\x1b[33m",
+        else => "\x1b[31m",
+    };
+}
+
+fn useColorForMode(mode: ColorMode) bool {
+    return switch (mode) {
+        .always => true,
+        .never => false,
+        .auto => switch (std.io.tty.detectConfig(std.fs.File.stderr())) {
+            .escape_codes => true,
+            else => false,
+        },
+    };
+}
+
 fn generateNoCommandTrace(
     allocator: Allocator,
     path: []const u8,
@@ -1173,7 +1204,7 @@ pub fn runTestFile(
 
     try executor.setTestEnv(abs_dirname, basename, opts.rootdir);
 
-    var trace_streamer = TraceStreamer.init(allocator, path, parser.lines.items, commands.items, opts.indent);
+    var trace_streamer = TraceStreamer.init(allocator, path, parser.lines.items, commands.items, opts.indent, opts.color);
     var results = try executor.execute(commands.items, if (opts.trace) &trace_streamer else null);
     defer {
         for (results.items) |r| {
@@ -1529,6 +1560,12 @@ pub const EnvVar = struct {
     value: []const u8,
 };
 
+pub const ColorMode = enum {
+    auto,
+    always,
+    never,
+};
+
 pub const Options = struct {
     shell: []const u8 = "/bin/sh",
     indent: usize = 4,
@@ -1538,6 +1575,7 @@ pub const Options = struct {
     patch: bool = false,
     inherit_env: bool = false,
     keep_tmpdir: bool = false,
+    color: ColorMode = .auto,
     xunit_file: ?[]const u8 = null,
     bindirs: []const []const u8 = &.{},
     env_vars: []const EnvVar = &.{},
@@ -1553,6 +1591,7 @@ const CliOptions = struct {
     debug: bool = false,
     @"inherit-env": bool = false,
     @"keep-tmpdir": bool = false,
+    color: ColorMode = .auto,
     bindir: opt.Multi([]const u8, 16) = .{},
     env: opt.Multi([]const u8, 32) = .{},
     version: bool = false,
@@ -1566,6 +1605,7 @@ const CliOptions = struct {
         .debug = .{ .short = 'd', .help = "Alias for -vv markdown trace" },
         .@"inherit-env" = .{ .short = 'E', .help = "Inherit parent environment" },
         .@"keep-tmpdir" = .{ .help = "Don't remove temp directories" },
+        .color = .{ .help = "Color output: auto, always, never" },
         .bindir = .{ .help = "Prepend DIR to PATH (repeatable)" },
         .env = .{ .short = 'e', .help = "Set environment variable VAR=VAL (repeatable)" },
         .version = .{ .short = 'V', .help = "Show version" },
@@ -1751,6 +1791,7 @@ pub fn main() !void {
         .patch = cli_opts.patch,
         .inherit_env = cli_opts.@"inherit-env",
         .keep_tmpdir = cli_opts.@"keep-tmpdir",
+        .color = cli_opts.color,
         .bindirs = abs_bindirs.items,
         .env_vars = env_vars.items,
         .rootdir = rootdir,
