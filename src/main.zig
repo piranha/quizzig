@@ -280,8 +280,14 @@ pub const Executor = struct {
         try self.env.put("ROOTDIR", rootdir);
     }
 
-    pub fn execute(self: *Executor, commands: []const TestCommand) !std.ArrayListUnmanaged(CommandResult) {
+    pub fn execute(self: *Executor, commands: []const TestCommand, trace: ?*TraceStreamer) !std.ArrayListUnmanaged(CommandResult) {
         var results: std.ArrayListUnmanaged(CommandResult) = .{};
+        errdefer {
+            for (results.items) |r| {
+                if (r.output.len > 0) self.allocator.free(r.output);
+            }
+            results.deinit(self.allocator);
+        }
 
         // Generate unique salt to avoid collisions with nested quizzig runs
         var salt_buf: [32]u8 = undefined;
@@ -299,6 +305,20 @@ pub const Executor = struct {
             }
             // Write salt marker - capture exit code first, then output marker
             try script.writer(self.allocator).print("__qz_ec=$?; env printf '\\n{s} {d} '\"$__qz_ec\"'\\n'\n", .{ salt, i });
+        }
+
+        // Parse output by salt markers as it arrives.
+        const salt_pattern = try std.fmt.allocPrint(self.allocator, "{s} ", .{salt});
+        defer self.allocator.free(salt_pattern);
+
+        var current_output: std.ArrayListUnmanaged(u8) = .{};
+        defer current_output.deinit(self.allocator);
+
+        var line_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer line_buf.deinit(self.allocator);
+
+        if (trace) |t| {
+            try t.start();
         }
 
         // Execute script via shell, merging stderr into stdout
@@ -321,57 +341,236 @@ pub const Executor = struct {
             child.stdin = null;
         }
 
-        // Read combined output
-        const output = try child.stdout.?.readToEndAlloc(self.allocator, 10 * 1024 * 1024);
-        defer self.allocator.free(output);
+        var read_buf: [4096]u8 = undefined;
+        while (true) {
+            const n = try child.stdout.?.read(&read_buf);
+            if (n == 0) break;
+
+            const chunk = read_buf[0..n];
+            var start_idx: usize = 0;
+            for (chunk, 0..) |byte, i| {
+                if (byte == '\n') {
+                    try line_buf.appendSlice(self.allocator, chunk[start_idx..i]);
+                    try processExecutorOutputLine(
+                        self.allocator,
+                        line_buf.items,
+                        salt_pattern,
+                        commands,
+                        &results,
+                        &current_output,
+                        trace,
+                    );
+                    line_buf.clearRetainingCapacity();
+                    start_idx = i + 1;
+                }
+            }
+            try line_buf.appendSlice(self.allocator, chunk[start_idx..]);
+        }
+
+        if (line_buf.items.len > 0) {
+            try processExecutorOutputLine(
+                self.allocator,
+                line_buf.items,
+                salt_pattern,
+                commands,
+                &results,
+                &current_output,
+                trace,
+            );
+        }
 
         _ = try child.wait();
 
-        // Parse output by salt markers
-        const salt_pattern = try std.fmt.allocPrint(self.allocator, "{s} ", .{salt});
-        defer self.allocator.free(salt_pattern);
-
-        var current_output: std.ArrayListUnmanaged(u8) = .{};
-        defer current_output.deinit(self.allocator);
-
-        var output_iter = mem.splitScalar(u8, output, '\n');
-
-        while (output_iter.next()) |line| {
-            if (mem.startsWith(u8, line, salt_pattern)) {
-                // Parse command index and exit code from this marker
-                const rest = line[salt_pattern.len..];
-                var parts = mem.splitScalar(u8, rest, ' ');
-                const idx_str = parts.next() orelse continue;
-                const idx = std.fmt.parseInt(usize, idx_str, 10) catch continue;
-                const exit_str = parts.next() orelse "0";
-                const exit_code = std.fmt.parseInt(u8, exit_str, 10) catch 0;
-
-                // Trim exactly one trailing newline (the one we added before salt marker)
-                var out = current_output.items;
-                if (out.len > 0 and out[out.len - 1] == '\n') {
-                    out = out[0 .. out.len - 1];
-                }
-
-                // Pad results array if needed
-                while (results.items.len <= idx) {
-                    try results.append(self.allocator, .{ .output = "", .exit_code = 0 });
-                }
-                results.items[idx] = .{
-                    .output = try self.allocator.dupe(u8, out),
-                    .exit_code = exit_code,
-                };
-
-                current_output.clearRetainingCapacity();
-            } else {
-                // Always append non-salt lines (including empty lines which represent blank output)
-                try current_output.appendSlice(self.allocator, line);
-                try current_output.append(self.allocator, '\n');
-            }
+        if (trace) |t| {
+            try t.finish();
         }
 
         return results;
     }
 };
+
+const TraceStreamer = struct {
+    allocator: Allocator,
+    path: []const u8,
+    source_lines: []const []const u8,
+    commands: []const TestCommand,
+    indent: usize,
+    src_line: usize = 1,
+    next_command: usize = 0,
+    pending_blank_lines: usize = 0,
+
+    fn init(
+        allocator: Allocator,
+        path: []const u8,
+        source_lines: []const []const u8,
+        commands: []const TestCommand,
+        indent: usize,
+    ) TraceStreamer {
+        return .{
+            .allocator = allocator,
+            .path = path,
+            .source_lines = source_lines,
+            .commands = commands,
+            .indent = indent,
+        };
+    }
+
+    fn start(self: *TraceStreamer) !void {
+        try getStderr().print("# quizzig trace: {s}\n", .{self.path});
+        try self.beginCommand(0);
+    }
+
+    fn beginCommand(self: *TraceStreamer, idx: usize) !void {
+        if (idx >= self.commands.len) return;
+        self.next_command = idx;
+
+        const cmd = self.commands[idx];
+        while (self.src_line < cmd.line_num) : (self.src_line += 1) {
+            try writeTraceSourceLine(self.source_lines, self.src_line);
+        }
+
+        const command_end = cmd.line_num + cmd.lines.items.len;
+        while (self.src_line < command_end) : (self.src_line += 1) {
+            try writeTraceSourceLine(self.source_lines, self.src_line);
+        }
+    }
+
+    fn outputLine(self: *TraceStreamer, line: []const u8) !void {
+        if (line.len == 0) {
+            self.pending_blank_lines += 1;
+            return;
+        }
+
+        try self.flushPendingBlankLines(self.pending_blank_lines);
+        self.pending_blank_lines = 0;
+        try writeTraceActualLine(self.allocator, self.indent, line);
+    }
+
+    fn endCommand(self: *TraceStreamer, idx: usize, status: u8) !void {
+        // The salt marker intentionally starts with a newline so it is never
+        // glued to command output. Drop that synthetic trailing blank line while
+        // preserving real blank output lines.
+        if (self.pending_blank_lines > 0) {
+            try self.flushPendingBlankLines(self.pending_blank_lines - 1);
+            self.pending_blank_lines = 0;
+        }
+
+        if (idx < self.commands.len) {
+            const cmd = self.commands[idx];
+            try getStderr().print("# quizzig: {s} line {d}\n", .{ traceStatusName(status), cmd.line_num });
+            self.src_line = cmd.line_num + cmd.lines.items.len + cmd.expected.items.len;
+        }
+
+        try self.beginCommand(idx + 1);
+    }
+
+    fn finish(self: *TraceStreamer) !void {
+        if (self.pending_blank_lines > 0) {
+            try self.flushPendingBlankLines(self.pending_blank_lines);
+            self.pending_blank_lines = 0;
+        }
+
+        while (self.src_line <= self.source_lines.len) : (self.src_line += 1) {
+            try writeTraceSourceLine(self.source_lines, self.src_line);
+        }
+    }
+
+    fn flushPendingBlankLines(self: *TraceStreamer, count: usize) !void {
+        for (0..count) |_| {
+            try writeTraceActualLine(self.allocator, self.indent, "");
+        }
+    }
+};
+
+fn commandTraceStatus(allocator: Allocator, cmd: *const TestCommand, result: CommandResult) !u8 {
+    if (result.exit_code == 80) return 's';
+
+    var diff_result = try generateDiff(allocator, cmd.expected.items, result.output, result.exit_code);
+    defer diff_result.deinit();
+
+    return if (hasDifferences(diff_result.lines.items)) '!' else '.';
+}
+
+fn processExecutorOutputLine(
+    allocator: Allocator,
+    line: []const u8,
+    salt_pattern: []const u8,
+    commands: []const TestCommand,
+    results: *std.ArrayListUnmanaged(CommandResult),
+    current_output: *std.ArrayListUnmanaged(u8),
+    trace: ?*TraceStreamer,
+) !void {
+    if (mem.startsWith(u8, line, salt_pattern)) {
+        // Parse command index and exit code from this marker.
+        const rest = line[salt_pattern.len..];
+        var parts = mem.splitScalar(u8, rest, ' ');
+        const idx_str = parts.next() orelse return;
+        const idx = std.fmt.parseInt(usize, idx_str, 10) catch return;
+        const exit_str = parts.next() orelse "0";
+        const exit_code = std.fmt.parseInt(u8, exit_str, 10) catch 0;
+
+        // Trim exactly one trailing newline (the one we added before salt marker).
+        var out = current_output.items;
+        if (out.len > 0 and out[out.len - 1] == '\n') {
+            out = out[0 .. out.len - 1];
+        }
+
+        // Pad results array if needed.
+        while (results.items.len <= idx) {
+            try results.append(allocator, .{ .output = "", .exit_code = 0 });
+        }
+        results.items[idx] = .{
+            .output = try allocator.dupe(u8, out),
+            .exit_code = exit_code,
+        };
+
+        if (trace) |t| {
+            const status = if (idx < commands.len)
+                try commandTraceStatus(allocator, &commands[idx], results.items[idx])
+            else
+                '!';
+            try t.endCommand(idx, status);
+        }
+
+        current_output.clearRetainingCapacity();
+    } else {
+        // Always append non-salt lines (including empty lines which represent blank output).
+        try current_output.appendSlice(allocator, line);
+        try current_output.append(allocator, '\n');
+        if (trace) |t| {
+            try t.outputLine(line);
+        }
+    }
+}
+
+fn writeTraceIndent(indent: usize) !void {
+    for (0..indent) |_| {
+        try getStderr().print(" ", .{});
+    }
+}
+
+fn writeTraceSourceLine(source_lines: []const []const u8, line_num: usize) !void {
+    if (line_num == 0) return;
+    const idx = line_num - 1;
+    if (idx >= source_lines.len) return;
+
+    // mem.splitScalar leaves a final empty item for files ending in '\n'.
+    // Do not render that phantom EOF line in trace output.
+    if (idx == source_lines.len - 1 and source_lines[idx].len == 0) return;
+
+    try getStderr().print("{s}\n", .{source_lines[idx]});
+}
+
+fn writeTraceActualLine(allocator: Allocator, indent: usize, line: []const u8) !void {
+    try writeTraceIndent(indent);
+    if (needsEscaping(line)) {
+        const escaped = try escapeOutput(allocator, line);
+        defer allocator.free(escaped);
+        try getStderr().print("{s} (esc)\n", .{escaped});
+    } else {
+        try getStderr().print("{s}\n", .{line});
+    }
+}
 
 // Escape handling for binary output
 pub fn escapeOutput(allocator: Allocator, input: []const u8) ![]const u8 {
@@ -974,7 +1173,8 @@ pub fn runTestFile(
 
     try executor.setTestEnv(abs_dirname, basename, opts.rootdir);
 
-    var results = try executor.execute(commands.items);
+    var trace_streamer = TraceStreamer.init(allocator, path, parser.lines.items, commands.items, opts.indent);
+    var results = try executor.execute(commands.items, if (opts.trace) &trace_streamer else null);
     defer {
         for (results.items) |r| {
             allocator.free(r.output);
@@ -1276,8 +1476,7 @@ pub fn runTestFile(
 
             const diff_slice = try diff_output.toOwnedSlice(allocator);
             errdefer allocator.free(diff_slice);
-            const trace_output = if (opts.trace) try generateTraceMarkdown(allocator, path, parser.lines.items, commands.items, results.items, status.items, opts.indent) else "";
-            errdefer if (trace_output.len > 0) allocator.free(trace_output);
+            const trace_output = "";
             const status_output = try status.toOwnedSlice(allocator);
 
             return .{
@@ -1293,8 +1492,7 @@ pub fn runTestFile(
         }
     }
 
-    const trace_output = if (opts.trace) try generateTraceMarkdown(allocator, path, parser.lines.items, commands.items, results.items, status.items, opts.indent) else "";
-    errdefer if (trace_output.len > 0) allocator.free(trace_output);
+    const trace_output = "";
     const status_output = try status.toOwnedSlice(allocator);
 
     return .{
